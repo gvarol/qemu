@@ -185,6 +185,7 @@ bool boot_strict;
 uint8_t *boot_splash_filedata;
 size_t boot_splash_filedata_size;
 uint8_t qemu_extra_params_fw[2];
+uint16_t nrf_id = 0xFFFF;
 
 int icount_align_option;
 
@@ -4202,6 +4203,18 @@ int main(int argc, char **argv, char **envp)
                 if (vmstate_dump_file == NULL) {
                     error_report("open %s: %s", optarg, strerror(errno));
                     exit(1);
+                }
+                break;
+            case QEMU_OPTION_nrf_id:
+                {
+                    char * endp;
+                    uint64_t id = strtoll(optarg, &endp, 0);
+                    if (*endp != '\0' || id >= 0xFFFF)
+                    {
+                        error_report("Device ID must be smaller than 65535.");
+                        exit(1);
+                    }
+                    nrf_id = id;
                 }
                 break;
             default:

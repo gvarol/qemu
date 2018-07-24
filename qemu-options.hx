@@ -4472,6 +4472,13 @@ contents of @code{iv.b64} to the second secret
 
 ETEXI
 
+DEF("nrf-id", HAS_ARG, QEMU_OPTION_nrf_id, \
+    "-nrf-id id use 'id' as nRF5x board device id\n", QEMU_ARCH_ARM)
+STEXI
+@item -nrf-id @var{id}
+@findex -nrf-id
+Use @var{id} as device id
+ETEXI
 
 HXCOMM This is the last statement. Insert new options before this line!
 STEXI
