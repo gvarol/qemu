@@ -2,9 +2,19 @@
 #define __NRF51_H__
 #include "exec/address-spaces.h"
 
-#define FLASH_256K (256 * 1024 * 1024)
-#define SRAM_32K (32 * 1024 * 1024)
+#define TIMER_LOG_ENABLED 0
+
+
+#define SRAM_32K (32 * 1024)
+#define SIZERAMBLOCKS (8192)
+#define NUMRAMBLOCK (SRAM_32K / SIZERAMBLOCKS)
 #define NRF51_SRAM_BASE (0x20000000)
+#define DEVICEID_HI (0x25411fc2)
+#define DEVICEID_LO (0x8d136c9c)
+#define DEVICEADDR_LO (0x87a4a811)
+#define DEVICEADDR_HI (0xeb96)
+#define DEVICEADDRTYPE_RANDOM 1
+#define DEVICEADDRTYPE_PUBLIC 0
 
 /*************************************\
  * Base Addresses
@@ -47,6 +57,25 @@
 #define RNG_BASE (0x4000D000)
 #define RNG_REG_SPACE (0x50C)
 
+#define NVM_BASE (0x4001E000)
+#define NVM_REG_SPACE (0x518)
+
+#define FICR_BASE (0x10000000)
+#define FICR_REG_SPACE (0x100)
+
+#define UICR_BASE (0x10001000)
+#define UICR_REG_SPACE (0x100)
+
+#define WDT_BASE (0x40010000)
+#define WDT_REG_SPACE (0x620)
+
+#define PPI_BASE (0x4001F000)
+#define PPI_REG_SPACE (0x810)
+
+//TODO: [WARNING] Same space is shared by other peripherals.
+#define CCM_BASE (0x4000F000)
+#define CCM_REG_SPACE (0x518)
+
 /*************************************\
  * Offsets
 \*************************************/
@@ -76,7 +105,7 @@ enum
     O_GPTE_IN1  = 0x104,
     O_GPTE_IN2  = 0x108,
     O_GPTE_IN3  = 0x10C,
-    O_GPTE_PORT = 0x17C,
+    O_GPTE_PORT = 0x17C, //FIXME: PPI
 
     //Registers
     O_GPTE_INTEN    = 0x300,
@@ -235,6 +264,177 @@ enum
     O_ECB_ECBDATAPTR = 0x504
 };
 
+enum
+{
+    O_NVM_READY = 0x400,
+    O_NVM_CONFIG = 0x504,
+    O_NVM_ERASEPAGE = 0x508,
+    O_NVM_ERASEPCR1 = O_NVM_ERASEPAGE, //Unusued, same in NRF51 SDK
+    O_NVM_ERASEALL = 0x50C,
+    O_NVM_ERASEPCR0 = 0x510,
+    O_NVM_ERASEUICR = 0x514
+};
+
+enum
+{
+    O_FICR_CODEPAGESIZE = 0x10,
+    O_FICR_CODESIZE = 0x14,
+    O_FICR_CLENR0 = 0x28,
+    O_FICR_PPFC = 0x2C,
+    O_FICR_NUMRAMBLOCK = 0x34,
+    O_FICR_SIZERAMBLOCK0 = 0x38,
+    O_FICR_SIZERAMBLOCK1 = 0x3C, //Deprecated
+    O_FICR_SIZERAMBLOCK2 = 0x40, //Deprecated
+    O_FICR_SIZERAMBLOCK3 = 0x44, //Deprecated
+    O_FICR_SIZERAMBLOCKS = O_FICR_SIZERAMBLOCK0,
+    O_FICR_CONFIGID = 0x5C,
+    O_FICR_DEVICEID0 = 0x60,
+    O_FICR_DEVICEID1 = 0x64,
+    O_FICR_ER0 = 0x80,
+    O_FICR_ER1 = 0x84,
+    O_FICR_ER2 = 0x88,
+    O_FICR_ER3 = 0x8C,
+    O_FICR_IR0 = 0x90,
+    O_FICR_IR1 = 0x94,
+    O_FICR_IR2 = 0x98,
+    O_FICR_IR3 = 0x9C,
+    O_FICR_DEVICEADDRTYPE = 0xA0,
+    O_FICR_DEVICEADDR0 = 0xA4,
+    O_FICR_DEVICEADDR1 = 0xA8,
+    O_FICR_OVERRIDEEN = 0xAC,
+    O_FICR_NRF_1MBIT0 = 0xB0,
+    O_FICR_NRF_1MBIT1 = 0xB4,
+    O_FICR_NRF_1MBIT2 = 0xB8,
+    O_FICR_NRF_1MBIT3 = 0xBC,
+    O_FICR_NRF_1MBIT4 = 0xC0,
+    O_FICR_BLE_1MBIT0 = 0xEC,
+    O_FICR_BLE_1MBIT1 = 0xF0,
+    O_FICR_BLE_1MBIT2 = 0xF4,
+    O_FICR_BLE_1MBIT3 = 0xF8,
+    O_FICR_BLE_1MBIT4 = 0xFC
+};
+
+enum
+{
+    O_UICR_CLENR0         = 0x00,
+    O_UICR_RBPCONF        = 0x04,
+    O_UICR_XTALFREQ       = 0x08,
+    O_UICR_FWID           = 0x10,
+    O_UICR_BOOTLOADERADDR = 0x14,
+    O_UICR_NRFFW1         = 0x18,
+    O_UICR_NRFFW14        = 0x4C,
+    O_UICR_NRFHW1         = 0x50,
+    O_UICR_NRFHW11        = 0x7C,
+    O_UICR_CUSTOMER0      = 0x80,
+    O_UICR_CUSTOMER31     = 0xFC,
+};
+
+enum
+{
+    //Tasks
+    O_TIMER_START   = 0x000,
+    O_TIMER_STOP    = 0x004,
+    O_TIMER_COUNT   = 0x008,
+    O_TIMER_CLEAR   = 0x00C,
+    O_TIMER_SHUTDOWN = 0x010,
+    O_TIMER_CAPTURE0 = 0x040,
+    O_TIMER_CAPTURE1 = 0x044,
+    O_TIMER_CAPTURE2 = 0x048,
+    O_TIMER_CAPTURE3 = 0x04C,
+
+    //Events
+    O_TIMER_COMPARE0 = 0x140,
+    O_TIMER_COMPARE1 = 0x144,
+    O_TIMER_COMPARE2 = 0x148,
+    O_TIMER_COMPARE3 = 0x14C,
+
+    //Registers
+    O_TIMER_SHORTS    = 0x200,
+    O_TIMER_INTENSET  = 0x304,
+    O_TIMER_INTENCLR  = 0x308,
+    O_TIMER_MODE      = 0x504,
+    O_TIMER_BITMODE   = 0x508,
+    O_TIMER_PRESCALER = 0x510,
+    O_TIMER_CC0       = 0x540,
+    O_TIMER_CC1       = 0x544,
+    O_TIMER_CC2       = 0x548,
+    O_TIMER_CC3       = 0x54C,
+
+};
+
+enum
+{
+    //Tasks
+    O_WDT_START     = 0x000,
+    //Events
+    O_WDT_TIMEOUT   = 0x100,
+    //Registers
+    O_WDT_INTENSET  = 0x304,
+    O_WDT_INTENCLR  = 0x308,
+    O_WDT_RUNSTATUS = 0x400,
+    O_WDT_REQSTATUS = 0x404,
+    O_WDT_CRV       = 0x504,
+    O_WDT_RREN      = 0x508,
+    O_WDT_CONFIG    = 0x50C,
+    O_WDT_RR0       = 0x600,
+    O_WDT_RR1       = 0x604,
+    O_WDT_RR2       = 0x608,
+    O_WDT_RR3       = 0x60C,
+    O_WDT_RR4       = 0x610,
+    O_WDT_RR5       = 0x614,
+    O_WDT_RR6       = 0x618,
+    O_WDT_RR7       = 0x61C
+};
+
+enum
+{
+    //Tasks
+    O_PPI_CHG_0_EN  = 0x000,
+    O_PPI_CHG_0_DIS = 0x004,
+    O_PPI_CHG_1_EN  = 0x008,
+    O_PPI_CHG_1_DIS = 0x00C,
+    O_PPI_CHG_2_EN  = 0x010,
+    O_PPI_CHG_2_DIS = 0x014,
+    O_PPI_CHG_3_EN  = 0x018,
+    O_PPI_CHG_3_DIS = 0x01C,
+
+    //Registers
+    O_PPI_CHEN      = 0x500,
+    O_PPI_CHENSET   = 0x504,
+    O_PPI_CHENCLR   = 0x508,
+    O_PPI_CH_0_EEP  = 0x510, //EEP register of the first channel.
+    O_PPI_CH_15_TEP = 0x58C, //TEP register of the last channel.
+    O_PPI_CHG_0     = 0x800,
+    O_PPI_CHG_1     = 0x804,
+    O_PPI_CHG_2     = 0x808,
+    O_PPI_CHG_3     = 0x80C,
+};
+
+enum
+{
+    //Task
+    O_CCM_KSGEN = 0x000,
+    O_CCM_CRYPT = 0x004,
+    O_CCM_STOP  = 0x008,
+
+    //Events
+    O_CCM_ENDKSGEN = 0x100,
+    O_CCM_ENDCRYPT = 0x104,
+    O_CCM_ERROR    = 0x108,
+
+    //Registers
+    O_CCM_SHORTS     = 0x200,
+    O_CCM_INTENSET   = 0x304,
+    O_CCM_INTENCLR   = 0x308,
+    O_CCM_MICSTATUS  = 0x400,
+    O_CCM_ENABLE     = 0x500,
+    O_CCM_MODE       = 0x504,
+    O_CCM_CNFPTR     = 0x508,
+    O_CCM_INPTR      = 0x50C,
+    O_CCM_OUTPTR     = 0x510,
+    O_CCM_SCRATCHPTR = 0x514
+};
+
 /*************************************\
  * IRQs
 \*************************************/
@@ -259,12 +459,16 @@ enum
 #define MASK_RTC_INTEN_COMPARE1 (1<<17)
 #define MASK_RTC_INTEN_COMPARE2 (1<<18)
 #define MASK_RTC_INTEN_COMPARE3 (1<<19)
-#define MASK_RTC_INTEN_ALLCOMPARE ((1<<16) | (1<<17) | (1<<18) | (1<<19))
+#define MASK_RTC_INTEN_OVERFLW  (1<<1) //0x2
+
+//#define MASK_RTC_INTEN_ALLCOMPARE ((1<<16) | (1<<17) | (1<<18) | (1<<19))
 
 #define MASK_RTC_COUNTER ((1<<24) - 1)
 
 #define MASK_GPIO_PINCNF_DIR   (0x1)
 #define MASK_GPIO_PINCNF_INPUT (0x2)
+
+#define MASK_CLOCK_LFCLKSRC (0x3)
 
 /*************************************\
  * Register Single Bits (Bit Pos.)
@@ -326,6 +530,24 @@ enum
 
 #define NRF51_RNG_STATE(obj) \
     OBJECT_CHECK(nrf51_rng_state, (obj), TYPE_NRF51_RNG)
+
+#define NRF51_NVM_STATE(obj) \
+    OBJECT_CHECK(nrf51_nvm_state, (obj), TYPE_NRF51_NVM)
+
+#define NRF51_FICR_STATE(obj) \
+    OBJECT_CHECK(nrf51_ficr_state, (obj), TYPE_NRF51_FICR)
+
+#define NRF51_UICR_STATE(obj) \
+    OBJECT_CHECK(nrf51_uicr_state, (obj), TYPE_NRF51_UICR)
+
+#define NRF51_WDT_STATE(obj) \
+    OBJECT_CHECK(nrf51_wdt_state, (obj), TYPE_NRF51_WDT)
+
+#define NRF51_PPI_STATE(obj) \
+    OBJECT_CHECK(nrf51_ppi_state, (obj), TYPE_NRF51_PPI)
+
+#define NRF51_CCM_STATE(obj) \
+    OBJECT_CHECK(nrf51_ccm_state, (obj), TYPE_NRF51_CCM)
 
 /*************************************\
  * General Macros
@@ -409,6 +631,21 @@ static inline void udp_set_uint16(uint8_t * dest, uint16_t value)
     dest[1] = value & 0xff;
 }
 
+static inline void hexdump(const char * label, const void * data, const int size)
+{
+    printf("%s:", label);
+    const uint8_t * _data = data;
+    for (int i = 0; i < size; i++)
+    {
+        if (i % 4 == 0)
+        {
+            puts("");
+        }
+        printf("%02x ", _data[i]);
+    }
+    puts("");
+}
+
 /*************************************\
  * Shared Functions
 \*************************************/
@@ -419,7 +656,9 @@ int nrf51_uart_comm_write(char * pchBuf, int nLen);
 
 int nrf51_udp_send(void * data, size_t len);
 void nrf51_udp_fill_hdr(nrf51_udp_proto_hdr *hdr, uint8_t proto_type, uint16_t len);
-void nrf51_trigger_hardfault(void);
+void _nrf51_trigger_hardfault(const char * file, int line);
+#define nrf51_trigger_hardfault() _nrf51_trigger_hardfault(__FILE__, __LINE__)
+void nrf51_radio_event_ready_ppi(void);
 
 extern uint32_t nrf_id;
 

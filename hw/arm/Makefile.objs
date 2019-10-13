@@ -21,6 +21,6 @@ obj-$(CONFIG_ASPEED_SOC) += aspeed_soc.o aspeed.o
 obj-$(CONFIG_MPS2) += mps2.o
 obj-$(CONFIG_MSF2) += msf2-soc.o msf2-som.o
 
-obj-y += nrf51.o nrf51_uart_comm.o nrf51_radio_comm.o
+obj-y += nrf51.o nrf51_uart_comm.o nrf51_radio_comm.o nrf51_aes_ccm.o nrf51_helper.o
 
 

@@ -9,15 +9,43 @@
 #include "hw/arm/arm.h"
 #include "sysemu/sysemu.h"
 
+#if 0
 #define RDP(fmt, ...) do{\
-    printf("[radio] ");\
+    qemu_mutex_lock(&mtx_console);\
+    printf("[RADIO] ");\
     printf(fmt, __VA_ARGS__);\
     puts("");\
+    fflush(stdout);\
+    qemu_mutex_unlock(&mtx_console);\
     }while(0)
+#else
+#define RDP(fmt, ...)do{}while(0)
+#endif
+
+#define RAD_LOCK() do{ \
+/*fprintf(stderr, "RAD_LOCK: %s\n", __func__); fflush(stderr);*/\
+qemu_mutex_lock(&mtx_radio); \
+}while(0)
+
+#define RAD_UNLOCK() do{ \
+/*fprintf(stderr, "RAD_UNLOCK: %s\n", __func__); fflush(stderr);*/\
+qemu_mutex_unlock(&mtx_radio); \
+}while(0)
+
+#define RAD_UNLOCK_RET(val) do{\
+    volatile typeof(val) ret = val;\
+    RAD_UNLOCK();\
+    return ret;\
+}while(0)
 
 #define RDP_DUMP(var) RDP(#var ": %u", var)
 
-#define PRINT_INCORRECT_STATE() RDP("incorrect radio state: %u, task: %u", s->radio_state, s->radio_task)
+#define PRINT_INCORRECT_STATE() do{\
+    RDP("%s:%d incorrect radio state: %s, task: %s", \
+    __FILE__, __LINE__, \
+    state_to_str(s->radio_state), task_to_str(s->radio_task)); \
+    g_assert(!"EXIT!"); \
+} while(0)
 
 //TODO: rename this macros
 #define READ_MSB_BYTE(val, byte) ( ( (val) >> (byte)*8) & 0xff )
@@ -52,6 +80,7 @@
 
 enum
 {
+    //Tasks
     O_RADIO_TXEN = 0x0,
     O_RADIO_RXEN = 0x4,
     O_RADIO_START = 0x8,
@@ -153,15 +182,15 @@ typedef enum
 
 typedef enum
 {
-    enmStateDisabled = 0, //Must always be zero.
-    enmStateRxRu,
-    enmStateRxIdle,
-    enmStateRx,
-    enmStateTxRu,
-    enmStateTxIdle,
-    enmStateTx,
-    enmStateRxDisable,
-    enmStateTxDisable,
+    enmStateDisabled  = 0, //Must always be zero.
+    enmStateRxRu      = 1,
+    enmStateRxIdle    = 2,
+    enmStateRx        = 3,
+    enmStateRxDisable = 4,
+    enmStateTxRu      = 9,
+    enmStateTxIdle    = 10,
+    enmStateTx        = 11,
+    enmStateTxDisable = 12,
 }NRF51_RADIO_STATE;
 
 typedef enum
@@ -172,7 +201,7 @@ typedef enum
     enmTaskStart,
     enmTaskStop,
     enmTaskDisable
-}NRF51_RADIO_TASK;
+}radio_task_t;
 
 typedef struct
 {
@@ -201,14 +230,19 @@ typedef struct _nrf51_radio_state
     SysBusDevice sb_parent;
     MemoryRegion iomem;
     qemu_irq irq;
-    ptimer_state * ptimer;
+    QEMUTimer * qtimer;
     bool timer_running;
 
     //Fields below will be set to zero on reset.
     //radio_state must always be at the beginning and REG must be the last.
     NRF51_RADIO_STATE radio_state;
-    NRF51_RADIO_TASK radio_task;
+    radio_task_t radio_task;
+    radio_task_t next_on_disabled;
+    bool irq17_pending;
+
     bool bPacketReceived;
+    uint8_t rx_buf[512];
+    uint8_t rx_len;
 
     struct
     {
@@ -231,17 +265,6 @@ typedef struct _nrf51_radio_state
     //REG struct must always be the last field in radio state.
     struct
     {
-        //Tasks
-        uint32_t TXEN;
-        uint32_t RXEN;
-        uint32_t START;
-        uint32_t STOP;
-        uint32_t DISABLE;
-        uint32_t RSSISTART;
-        uint32_t RSSISTOP;
-        uint32_t BCSTART;
-        uint32_t BCSTOP;
-
         //Events
         uint32_t READY;
         uint32_t ADDRESS;
@@ -279,7 +302,7 @@ typedef struct _nrf51_radio_state
         uint32_t TEST;
         uint32_t TIFS; //Only available in BLE_1MBIT mode.
         uint32_t RSSISAMPLE;
-        uint32_t STATE;
+        //uint32_t STATE;
         uint32_t DATAWHITEIV;
         uint32_t BCC;
         uint32_t DAB[8];

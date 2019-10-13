@@ -1,18 +1,21 @@
 #include "qemu/osdep.h"
+#include "qemu/log.h"
 #include "hw/boards.h"
 #include "hw/arm/arm.h"
 #include "qemu-common.h"
 #include "cpu.h"
-#include "hw/arm/arm.h"
 #include "exec/address-spaces.h"
 #include "qapi/error.h"
 #include "hw/misc/unimp.h"
 #include "hw/ptimer.h"
 #include "sysemu/sysemu.h"
-#include "nrf51.h"
+#include "nrf51_states.h"
 #include "nrf51_radio.h"
+#include "nrf51_helper.h"
 #include "sys/socket.h"
 #include "crypto/cipher.h"
+#include "qemu/qht.h" //hashtable
+#include "nrf51_aes_ccm.h"
 
 #ifdef __GNUC__
 #pragma GCC diagnostic push
@@ -22,12 +25,14 @@
 /*************************************\
  * Defines that are required here.
 \*************************************/
-#define RTC_NUM_CC_REGS (4)
-#define AES_ECB_BLOCK_SZ (16) //Unit is bytes
 #define AES_ECB_READ_SZ (AES_ECB_BLOCK_SZ*2)
 #define AES_ECB_CIPHERTEXT_OFFSET (AES_ECB_BLOCK_SZ*2)
-#define AES_ECB_HDR_SZ (AES_ECB_BLOCK_SZ*3)
+#define NRF51_CODEPAGESIZE (1024)
+#define NRF51_FLASH_SIZE_IN_BYTES (NRF51_CODESIZE * NRF51_CODEPAGESIZE) //256K
+#define AES_CCM_MAX_PKT_SZ (27) //FIXME: Need to verify on the hardware.
+#define AES_CCM_SCRATCH_SZ (16 + AES_CCM_MAX_PKT_SZ)
 
+#pragma region TypeDevInitIO
 /*************************************\
  * Device Types
 \*************************************/
@@ -41,8 +46,13 @@ static const char TYPE_NRF51_RNG[] = "nrf51-rng";
 static const char TYPE_NRF51_RTC[] = "nrf51-rtc";
 static const char TYPE_NRF51_TIMER[] = "nrf51-timer";
 static const char TYPE_NRF51_UART[] = "nrf51-uart";
+static const char TYPE_NRF51_NVM[] = "nrf51-nvm";
+static const char TYPE_NRF51_FICR[] = "nrf51-ficr";
+static const char TYPE_NRF51_UICR[] = "nrf51-uicr";
+static const char TYPE_NRF51_WDT[] = "nrf51-wdt";
+static const char TYPE_NRF51_PPI[] = "nrf51-ppi";
+static const char TYPE_NRF51_CCM[] = "nrf51-ccm";
 
-#pragma region DevInit
 /*************************************\
  * Dev. Init & IO Function Prototypes.
 \*************************************/
@@ -56,6 +66,12 @@ static void nrf51_rng_init(Object *obj);
 static void nrf51_rtc_init(Object *obj);
 static void nrf51_timer_init(Object *obj);
 static void nrf51_uart_init(Object *obj);
+static void nrf51_nvm_init(Object *obj);
+static void nrf51_ficr_init(Object *obj);
+static void nrf51_uicr_init(Object *obj);
+static void nrf51_wdt_init(Object *obj);
+static void nrf51_ppi_init(Object *obj);
+static void nrf51_ccm_init(Object *obj);
 
 static void nrf51_adc_class_init(ObjectClass *class, void *data);
 static void nrf51_clock_class_init(ObjectClass *class, void *data);
@@ -67,6 +83,12 @@ static void nrf51_rng_class_init(ObjectClass *class, void *data);
 static void nrf51_rtc_class_init(ObjectClass *class, void *data);
 static void nrf51_timer_class_init(ObjectClass *class, void *data);
 static void nrf51_uart_class_init(ObjectClass *class, void *data);
+static void nrf51_nvm_class_init(ObjectClass *class, void *data);
+static void nrf51_ficr_class_init(ObjectClass *class, void *data);
+static void nrf51_uicr_class_init(ObjectClass *class, void *data);
+static void nrf51_wdt_class_init(ObjectClass *class, void *data);
+static void nrf51_ppi_class_init(ObjectClass *class, void *data);
+static void nrf51_ccm_class_init(ObjectClass *class, void *data);
 
 static void nrf51_gpio_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
 static void nrf51_clock_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
@@ -77,6 +99,13 @@ static void nrf51_uart_write(void * opaque, hwaddr offset, uint64_t value, unsig
 static void nrf51_ecb_write(void *opaque, hwaddr offset, uint64_t value, unsigned size);
 static void nrf51_rng_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
 static void nrf51_timer_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_nvm_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_nvm_data_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_ficr_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_uicr_write(void *opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_wdt_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_ppi_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
+static void nrf51_ccm_write(void * opaque, hwaddr offset, uint64_t value, unsigned int size);
 
 static uint64_t nrf51_adc_read(void *opaque, hwaddr offset, unsigned int size);
 static uint64_t nrf51_clock_read(void * opaque, hwaddr offset, unsigned int size);
@@ -87,220 +116,13 @@ static uint64_t nrf51_rng_read(void *opaque, hwaddr offset, unsigned int size);
 static uint64_t nrf51_rtc_read(void *opaque, hwaddr offset, unsigned int size);
 static uint64_t nrf51_timer_read(void *opaque, hwaddr offset, unsigned int size);
 static uint64_t nrf51_uart_read(void *opaque, hwaddr offset, unsigned int size);
-#pragma endregion
+static uint64_t nrf51_nvm_read(void *opaque, hwaddr offset, unsigned int size);
+static uint64_t nrf51_ficr_read(void *opaque, hwaddr offset, unsigned int size);
+static uint64_t nrf51_uicr_read(void *opaque, hwaddr offset, unsigned int size);
+static uint64_t nrf51_wdt_read(void *opaque, hwaddr offset, unsigned int size);
+static uint64_t nrf51_ppi_read(void *opaque, hwaddr offset, unsigned int size);
+static uint64_t nrf51_ccm_read(void *opaque, hwaddr offset, unsigned int size);
 
-#pragma region DeviceStates
-/*************************************\
- * Device States
-\*************************************/
-typedef struct _nrf51_rng_state
-{
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    ptimer_state * ptimer;
-    struct
-    {
-        uint32_t VALRDY;
-        uint32_t SHORTS;
-        uint32_t INTEN;
-        uint32_t CONFIG;
-        uint32_t VALUE;
-    } REG;
-} nrf51_rng_state;
-
-typedef struct _nrf51_gpio_state {
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-
-    struct _nrf51_gpte_state * owner[NUM_GPIO_PINS];
-    int owner_id[NUM_GPIO_PINS];
-    struct {
-        uint32_t OUT;       //0x504
-        uint32_t OUTSET;    //0x508
-        uint32_t OUTCLR;    //0x50C
-        uint32_t IN;
-        uint32_t DIR;
-        uint32_t DIRSET;
-        uint32_t DIRCLR;
-        uint32_t PINCNF[NUM_GPIO_PINS];
-    } REG;
-} nrf51_gpio_state;
-
-typedef struct _nrf51_gpte_state
-{
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    //ptimer_state * pt_conversion;
-
-    //Can be used for in/out, depending on configured mode.
-    uint8_t io_state[4];
-    struct
-    {
-        //Events
-        uint32_t IN[4];
-        uint32_t PORT;
-
-        //Registers
-        uint32_t INTEN;
-        uint32_t CONFIG[4];
-    } REG;
-} nrf51_gpte_state;
-
-typedef struct _nrf51_clock_state
-{
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    struct
-    {
-        //Events
-        uint32_t HFCLKSTARTED;
-        uint32_t LFCLKSTARTED;
-        uint32_t DONE;
-        uint32_t CTTO;
-
-        //Registers
-        uint32_t INTEN;
-        uint32_t HFCLKRUN;
-        uint32_t HFCLKSTAT;
-        uint32_t LFCLKRUN;
-        uint32_t LFCLKSTAT;
-        uint32_t LFCLKSRCCOPY;
-        uint32_t LFCLKSRC;
-        uint32_t CTIV;
-        uint32_t XTALFREQ;
-    } REG;
-} nrf51_clock_state;
-
-typedef struct
-{
-    uint8_t key[AES_ECB_BLOCK_SZ];
-    uint8_t cleartext[AES_ECB_BLOCK_SZ];
-    uint8_t ciphertext[AES_ECB_BLOCK_SZ];
-} nrf51_ecb_data;
-
-//Make sure that struct is not aligned in any way.
-QEMU_BUILD_BUG_ON(sizeof(nrf51_ecb_data) !=  AES_ECB_HDR_SZ);
-
-typedef struct _nrf51_ecb_state
-{
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    struct
-    {
-        //Events
-        uint32_t ENDECB;
-        uint32_t ERRORECB;
-
-        //Registers
-        uint32_t INTEN;
-        uint32_t ECBDATAPTR;
-    } REG;
-
-    QCryptoCipher * cipher_ctx;
-    uint8_t current_key[AES_ECB_BLOCK_SZ];
-    nrf51_ecb_data ecb_data;
-} nrf51_ecb_state;
-
-typedef struct _nrf51_uart_state {
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    ptimer_state * ptimer;
-
-    int bUartEnabled;
-    int bFlowCtrlEnabled; //HW Flow Control
-    int bCtsEnabled;
-    int bNotCtsEnabled;
-    int bNewByte;
-    int bReadOk;
-    uint32_t uTimerTaskFlags;
-
-    struct {
-        //Events
-        uint32_t CTS;
-        uint32_t NCTS;
-        uint32_t RXDRDY;
-        uint32_t TXDRDY;
-        uint32_t ERROR;
-        uint32_t RXTO; //RX Timeout
-
-        //Registers
-        uint32_t INTEN;
-        uint32_t ENABLE;
-        uint32_t PSELCTS;
-        uint32_t PSELRTS;
-        uint32_t PSELRXD;
-        uint32_t PSELTXD;
-        uint32_t RXD;
-        uint32_t TXD;
-        uint32_t BAUDRATE;
-        uint32_t CONFIG;
-    } REG;
-} nrf51_uart_state;
-
-typedef struct _nrf51_rtc_state {
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    ptimer_state * ptimer;
-    int num_instance;
-    bool bRunning;
-    struct {
-        //Tasks
-        uint32_t START;
-        uint32_t STOP;
-        uint32_t CLEAR;
-        uint32_t TRIGOVRFLW;
-        //Events
-        uint32_t TICK;
-        uint32_t OVRFLW;
-        uint32_t COMPARE[RTC_NUM_CC_REGS]; //4 Events
-        //Registers
-        uint32_t INTEN;
-        uint32_t INTENSET;
-        uint32_t INTENCLR;
-        uint32_t EVTEN;
-        uint32_t EVTENSET;
-        uint32_t EVTENCLR;
-        uint32_t COUNTER;
-        uint32_t PRESCALER;
-        uint32_t CC[RTC_NUM_CC_REGS]; // 4 Compare registers
-    } REG;
-} nrf51_rtc_state;
-
-typedef struct _nrf51_adc_state {
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    ptimer_state * pt_conversion;
-    int bConversionActive;
-    int nNoiseBits;
-    struct {
-        uint32_t START;
-        uint32_t STOP;
-        uint32_t END;
-        uint32_t INTEN;
-        uint32_t ENABLE;
-        uint32_t CONFIG;
-        uint32_t RESULT;
-    } REG;
-} nrf51_adc_state;
-
-typedef struct _nrf51_timer_state
-{
-    SysBusDevice sb_parent;
-    MemoryRegion iomem;
-    qemu_irq irq;
-    //ptimer_state * pt_conversion;
-    struct
-    {
-
-    } REG;
-} nrf51_timer_state;
 #pragma endregion
 
 #pragma region TypeInfo
@@ -386,7 +208,56 @@ static const TypeInfo nrf51_mod_rng = {
     .instance_init = nrf51_rng_init,
     .class_init    = nrf51_rng_class_init,
 };
-#pragma endregion
+
+static const TypeInfo nrf51_mod_nvm = {
+    .name          = TYPE_NRF51_NVM,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(nrf51_nvm_state),
+    .instance_init = nrf51_nvm_init,
+    .class_init    = nrf51_nvm_class_init,
+};
+
+static const TypeInfo nrf51_mod_ficr = {
+    .name          = TYPE_NRF51_FICR,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(nrf51_ficr_state),
+    .instance_init = nrf51_ficr_init,
+    .class_init    = nrf51_ficr_class_init,
+};
+
+static const TypeInfo nrf51_mod_uicr = {
+    .name          = TYPE_NRF51_UICR,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(nrf51_uicr_state),
+    .instance_init = nrf51_uicr_init,
+    .class_init    = nrf51_uicr_class_init,
+};
+
+static const TypeInfo nrf51_mod_wdt = {
+    .name          = TYPE_NRF51_WDT,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(nrf51_wdt_state),
+    .instance_init = nrf51_wdt_init,
+    .class_init    = nrf51_wdt_class_init,
+};
+
+static const TypeInfo nrf51_mod_ppi = {
+    .name          = TYPE_NRF51_PPI,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(nrf51_ppi_state),
+    .instance_init = nrf51_ppi_init,
+    .class_init    = nrf51_ppi_class_init,
+};
+
+static const TypeInfo nrf51_mod_ccm = {
+    .name          = TYPE_NRF51_CCM,
+    .parent        = TYPE_SYS_BUS_DEVICE,
+    .instance_size = sizeof(nrf51_ccm_state),
+    .instance_init = nrf51_ccm_init,
+    .class_init    = nrf51_ccm_class_init,
+};
+
+#pragma endregion //TypeInfo
 
 #pragma region MemoryRegionOps
 /*************************************\
@@ -472,25 +343,106 @@ static const MemoryRegionOps nrf51_gpte_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
-#pragma endregion
+static const MemoryRegionOps nrf51_nvm_ops = {
+    .read = nrf51_nvm_read,
+    .write = nrf51_nvm_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps nrf51_nvm_data_ops = {
+    .read = NULL,
+    .write = nrf51_nvm_data_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps nrf51_ficr_ops = {
+    .read = nrf51_ficr_read,
+    .write = nrf51_ficr_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps nrf51_uicr_ops = {
+    .read = nrf51_uicr_read,
+    .write = nrf51_uicr_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps nrf51_wdt_ops = {
+    .read = nrf51_wdt_read,
+    .write = nrf51_wdt_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps nrf51_ppi_ops = {
+    .read = nrf51_ppi_read,
+    .write = nrf51_ppi_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+static const MemoryRegionOps nrf51_ccm_ops = {
+    .read = nrf51_ccm_read,
+    .write = nrf51_ccm_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+#pragma endregion //MemoryRegionOps
 
 //TODO: Use the correct value, check datasheet?
 #define NUM_IRQ_LINES (64)
+#define FREQ_16MHZ (16000000)
 
 #define UART_ENABLE_REG_VAL  0x4
 #define UART_DISABLE_REG_VAL 0x0
 
+#define NVM_CONFIG_RO  0x0  //Read-only
+#define NVM_CONFIG_WEN 0x1  //Write Enable
+#define NVM_CONFIG_EEN 0x2  //Erase Enable
+
+#define TIMER_MODE_TIMER   0x0
+#define TIMER_MODE_COUNTER 0x1
+
+#define CLOCK_STAT_RUNNING (1<<16)
+
+#define WDT_RELOAD_VALUE (0x6E524635UL)
 #define ECB_ERRORECB_MASK (0x2)
 #define ECB_ENDECB_MASK (0x1)
 
+//Simulated process time for NVM actions.
+#define NVM_OP_TIME_NS (300)
+
+#define NRF51_FLASH_ORIGIN (0x0)
+
 #define SERVER_PORT 5151
 #define SERVER_ADDR "127.0.0.1"
+
+#define UICR_REG_FILE "uicr.bin"
 
 typedef struct
 {
     hwaddr base;
     int irq;
 } base_irq_pair;
+
+typedef struct
+{
+    hwaddr base;
+    int irq;
+    uint32_t counter_max; // Maximum counter size
+} timer_config;
 
 typedef struct _nrf51_udp_conn
 {
@@ -501,8 +453,49 @@ typedef struct _nrf51_udp_conn
     uint_fast32_t uBytesSent;
 } nrf51_udp_conn;
 
+typedef struct
+{
+    const char * kernel_filename;
+    //FIXME: Use nvic
+    DeviceState * nvic;
+    MemoryRegion sram;
+} nrf51_boot_info;
+
+typedef struct ccm_cnf
+{
+    uint8_t key[AES_ECB_BLOCK_SZ]; //TODO: Use a new define as s->key[]
+    //pktr[4]: Bit0-6: used, Bit7: ignored
+    uint64_t pktctr; //big endian 39-bit
+    uint8_t direction_bit; //bit0: direction, zero padded
+    uint8_t iv[8];
+} QEMU_PACKED ccm_cnf_t;
+QEMU_BUILD_BUG_ON(sizeof(ccm_cnf_t) != 33);
+
+#define CCM_PKT_CTR_MASK ((1 << 39) - 1)
+
+//Common functions for encrypted and plain text packet structures.
+static uint8_t get_ccm_hdr(uint8_t * ptr) { return *ptr; }
+static uint8_t get_ccm_len(uint8_t * ptr) { return ptr[1]; }
+static uint8_t * get_ccm_data_ptr(uint8_t * ptr) { return ptr + 3; }
+
+#pragma region Implementation
 static void nrf51_udp_send_id_handler(void * opaque, uint8_t * data, uint_fast16_t len);
 static void nrf51_gpio_udp_handler(void * opaque, uint8_t * data, uint_fast16_t len);
+static void nrf51_timer_tick(void * opaque);
+static void nrf51_timer_qtick(void * opaque);
+static void nrf51_rtc_timer(void * opaque);
+static void nrf51_rtc_tick(void *opaque);
+
+static int64_t nrf51_timer_set_next_event(nrf51_timer_state * s);
+
+static uint32_t nrf51_timer_getmask(nrf51_timer_state * s);
+
+static void nrf51_nvm_erase_page(nrf51_nvm_state * s, uint32_t offset, bool is_region_0);
+static void nrf51_nvm_set_dirty_bit(nrf51_nvm_state * s, uint_fast32_t page_num);
+static void nrf51_uicr_load_regs(nrf51_uicr_state * s);
+static void nrf51_uicr_save_regs(nrf51_uicr_state * s);
+static void ppi_event_filter(uint32_t event_addr);
+static void ppi_add_event(uint8_t chan, uint32_t eep, uint32_t tep);
 
 static inline int nrf51_gpte_read_mode(nrf51_gpte_state *s, const int id)
 {
@@ -561,6 +554,7 @@ static void nrf51_gpte_set_event(nrf51_gpte_state *s, const int id, const bool s
     s->io_state[id] = state;
     //FIXME: Check PORT event.
     s->REG.IN[id] = 1;
+    ppi_event_filter(GPTE_BASE + O_GPTE_IN0 + id * 4);
     if (s->REG.INTEN & (1<<id)){
         qemu_irq_pulse(s->irq);
     }
@@ -572,10 +566,10 @@ static const base_irq_pair RTC_BASE_IRQ_LIST[RTC_TOTAL] = {
     //{ RTC2_BASE, IRQ_RTC2 } //Doesn't exist on NRF51
 };
 
-static const base_irq_pair TIMER_BASE_IRQ_LIST[TIMER_TOTAL] = {
-    { TIMER0_BASE, IRQ_TIMER0},
-    { TIMER1_BASE, IRQ_TIMER1},
-    { TIMER2_BASE, IRQ_TIMER2}
+static const timer_config TIMER_CONFIG[TIMER_TOTAL] = {
+    { TIMER0_BASE, IRQ_TIMER0, 0xFFFFFFFF}, //32 bit counter
+    { TIMER1_BASE, IRQ_TIMER1, 0xFFFF},     //16 bit counter
+    { TIMER2_BASE, IRQ_TIMER2, 0xFFFF}      //16 bit counter
 };
 
 nrf51_udp_packet_handler packet_handlers[PROTO_TOTAL] =
@@ -591,6 +585,8 @@ void * packet_handler_context[PROTO_TOTAL] = {0x0};
 static nrf51_udp_conn udp_conn;
 
 static DeviceState * nvic;
+static nrf51_boot_info bootinfo;
+static ppi_global_state ppis;
 
 /*
  * Almost all modules are implemented
@@ -887,7 +883,6 @@ static void nrf51_udp_init(void)
 
         nrf51_udp_fill_hdr((nrf51_udp_proto_hdr*)&pkt,
                             PROTO_SEND_ID, UDP_SEND_ID_MSG_SZ);
-        //FIXME: Get id from cmd line.
         udp_set_uint16(pkt.id, nrf_id);
         nrf51_udp_send(&pkt, sizeof(pkt));
     }
@@ -897,37 +892,30 @@ static void nrf51_init(MachineState *ms)
 {
     int k;
 
+    bootinfo.kernel_filename = ms->kernel_filename;
+
     printf("[DP] Kernel file: %s\n", ms->kernel_filename);
 
-    if (nrf_id >= 0xFFFF){
+    if (nrf_id >= 0xFFFF)
+    {
         printf("Please specify device id with -nrf-id <id>\n");
         exit(1);
     }
-#if defined(__unix__) | defined(__APPLE__)
+#if defined(__unix__) || defined(__APPLE__)
     xsrand_init();
 #else
 #warning "No random seed initializer function is defined for this platform."
 #endif
 
-    //DeviceState *nvic, *dev;
-
-    MemoryRegion *sram = g_new(MemoryRegion, 1);
-    MemoryRegion *flash = g_new(MemoryRegion, 1);
     MemoryRegion *system_memory = get_system_memory();
 
-    /* Flash */
-    memory_region_init_ram(flash, NULL, "nrf51_flash", FLASH_256K,
-                           &error_fatal);
-    memory_region_set_readonly(flash, true);
-    memory_region_add_subregion(system_memory, 0x0, flash); //Subregion at offset 0x0
-
     /* SRAM */
-    memory_region_init_ram(sram, NULL, "nrf51_sram", SRAM_32K,
+    memory_region_init_ram(&bootinfo.sram, NULL, "nrf51_sram", SRAM_32K,
                            &error_fatal);
-    memory_region_add_subregion(system_memory, NRF51_SRAM_BASE, sram);
+    memory_region_add_subregion(system_memory, NRF51_SRAM_BASE, &bootinfo.sram);
 
     //TODO: null check, can this even fail?
-    nvic = armv7m_init(system_memory, FLASH_256K, NUM_IRQ_LINES,
+    nvic = armv7m_init(system_memory, NRF51_FLASH_SIZE_IN_BYTES, NUM_IRQ_LINES,
                        ms->kernel_filename, ms->cpu_type);
 
     //Create global udp connection for multi instance communication.
@@ -951,7 +939,7 @@ static void nrf51_init(MachineState *ms)
     //Create TIMER Modules
     for (k = 0; k < TIMER_TOTAL; k++)
     {
-        sysbus_create_simple(TYPE_NRF51_TIMER, TIMER_BASE_IRQ_LIST[k].base, NULL);
+        sysbus_create_simple(TYPE_NRF51_TIMER, TIMER_CONFIG[k].base, NULL);
     }
 
     //Create ADC Module
@@ -973,7 +961,26 @@ static void nrf51_init(MachineState *ms)
     //Create RADIO Module
     sysbus_create_simple(TYPE_NRF51_RADIO, RADIO_BASE, NULL);
 
+    //Create RNG Module
     sysbus_create_simple(TYPE_NRF51_RNG, RNG_BASE, NULL);
+
+    //Create NVM Module
+    sysbus_create_simple(TYPE_NRF51_NVM, NVM_BASE, NULL);
+
+    //Create FICR Module
+    sysbus_create_simple(TYPE_NRF51_FICR, FICR_BASE, NULL);
+
+    //Create UICR Module
+    sysbus_create_simple(TYPE_NRF51_UICR, UICR_BASE, NULL);
+
+    //Create WDT Module
+    sysbus_create_simple(TYPE_NRF51_WDT, WDT_BASE, NULL);
+
+    //Create PPI Module
+    sysbus_create_simple(TYPE_NRF51_PPI, PPI_BASE, NULL);
+
+    //Create CCM Module
+    sysbus_create_simple(TYPE_NRF51_CCM, CCM_BASE, NULL);
 
     //Used in is_manual_peripheral_setup_needed, called by SystemInit
     create_unimplemented_device("UNKNOWN", 0xF0000000, 0x1000);
@@ -989,6 +996,275 @@ static void nrf51_machine_init(MachineClass *mc)
 
 #define UART_STARTRX_TASK (1<<0)
 #define UART_STARTTX_TASK (1<<2)
+
+static uint64_t nrf51_nvm_read(void *opaque, hwaddr offset,
+                          unsigned int size)
+{
+    nrf51_nvm_state *s = opaque;
+
+    switch(offset)
+    {
+        case O_NVM_READY:
+        {
+            return 1;
+        }
+
+        case O_NVM_CONFIG:
+            return s->REG.CONFIG;
+    }
+    return (uint64_t)-1;
+}
+
+static void nrf51_nvm_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+    nrf51_nvm_state *s = opaque;
+    switch(offset)
+    {
+        case O_NVM_CONFIG:
+            s->REG.CONFIG = value;
+            break;
+
+            break;
+
+        case O_NVM_ERASEPCR0: //Code Region 0
+        case O_NVM_ERASEPCR1: //Code Region 1
+            nrf51_nvm_erase_page(s, value, offset == O_NVM_ERASEPCR0);
+            break;
+    }
+}
+
+static void nrf51_nvm_erase_page(nrf51_nvm_state * s, uint32_t offset, bool is_region_0)
+{
+    const uint8_t access_mode = s->REG.CONFIG & 0x3;
+
+    if (access_mode != NVM_CONFIG_EEN)
+    {
+        return;
+    }
+
+    if ( (offset % NRF51_CODEPAGESIZE) || (offset >= NRF51_FLASH_SIZE_IN_BYTES) )
+    {
+        fprintf(stderr, "warning: erase page, incorrect ptr: 0x%x\n", offset);
+        return;
+    }
+
+    uint8_t * const ram_ptr = memory_region_get_ram_ptr(&s->flash);
+
+    memset(ram_ptr + offset, 0xFF, NRF51_CODEPAGESIZE);
+    nrf51_nvm_set_dirty_bit(s, offset / NRF51_CODEPAGESIZE);
+}
+
+static bool nrf51_nvm_fopen_kernel(nrf51_nvm_state * s)
+{
+    if (!s->fpkernel)
+    {
+        s->fpkernel = fopen(bootinfo.kernel_filename, "r+b");
+    }
+
+    const bool ret = !!s->fpkernel;
+    if (!ret)
+    {
+        fprintf(stderr, "unable to open kernel file\n");
+    }
+    return ret;
+}
+
+static void nrf51_nvm_fclose_kernel(nrf51_nvm_state * s)
+{
+    if (s->fpkernel)
+    {
+        fflush(s->fpkernel);
+        fclose(s->fpkernel);
+        s->fpkernel = NULL;
+    }
+}
+
+static void nrf51_nvm_sync_to_file(void * opaque)
+{
+    nrf51_nvm_state * s = opaque;
+
+    uint8_t * const ram_ptr = memory_region_get_ram_ptr(&s->flash);
+
+    if (!nrf51_nvm_fopen_kernel(s))
+    {
+        //TODO: exit or warning?
+        exit(1);
+    }
+
+    for (int i = 0; i < sizeof(s->nvm_dirty_bits); i++)
+    {
+        const uint8_t bits = s->nvm_dirty_bits[i];
+        if (bits)
+        {
+            for (int p = 0; p < 8; p++)
+            {
+                if ((bits >> p) & 1)
+                {
+                    bool ok;
+                    const uint8_t page = i * 8 + p;
+                    const long offset = page * NRF51_CODEPAGESIZE;
+                    //TODO: remove debug output
+                    printf("sync dirty page: %u\n", page);
+                    ok = !fseek(s->fpkernel, offset, SEEK_SET);
+                    ok = ok && (fwrite(ram_ptr + offset, 1,
+                                       NRF51_CODEPAGESIZE, s->fpkernel) == NRF51_CODEPAGESIZE);
+
+                    if (!ok)
+                    {
+                        //TODO: error handling.
+                        fprintf(stderr, "file I/O error\n");
+                        exit(1);
+                    }
+                }
+            }
+            s->nvm_dirty_bits[i] = 0;
+        }
+    }
+
+    nrf51_nvm_fclose_kernel(s);
+}
+
+static void nrf51_nvm_set_dirty_bit(nrf51_nvm_state * s, uint_fast32_t page_num)
+{
+    s->nvm_dirty_bits[page_num/8] |= 1 << (page_num % 8);
+
+    if (!s->file_sync)
+    {
+        QEMUBH *bh = qemu_bh_new(nrf51_nvm_sync_to_file, s);
+
+        s->file_sync = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
+        if (!s->file_sync)
+        {
+            fprintf(stderr, "ptimer_init errror!");
+            exit(1);
+        }
+    }
+
+    //Delay file system writes for a second
+    ptimer_stop(s->file_sync);
+    ptimer_set_freq(s->file_sync, 1);
+    ptimer_set_count(s->file_sync, 1);
+    ptimer_run(s->file_sync, 1);
+}
+
+static void nrf51_nvm_data_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+    nrf51_nvm_state * const s = opaque;
+    const uint8_t access_mode = s->REG.CONFIG & 0x3;
+    const uint_fast32_t page_num = offset / NRF51_CODEPAGESIZE; //Page number;
+    if (access_mode != NVM_CONFIG_WEN)
+    {
+        if (access_mode > NVM_CONFIG_EEN)
+        {
+            fprintf(stderr, "warning: incorrect NVM access mode configuration\n");
+        }
+        return;
+    }
+
+    uint8_t * const ram_ptr = memory_region_get_ram_ptr(&s->flash);
+
+    //FIXME: check that offset is aligned. Is it required???
+
+    printf("NVM write at: 0x%x = 0x%x\n", (uint32_t) offset, (uint32_t)value);
+
+    uint32_t * const ptr = (uint32_t*) (ram_ptr + offset);
+
+    *ptr &= value; //NVM behaves in that way if area is not erased.
+
+    nrf51_nvm_set_dirty_bit(s, page_num);
+}
+
+static uint64_t nrf51_uicr_read(void *opaque, hwaddr offset,
+                          unsigned int size)
+{
+    nrf51_uicr_state *s = opaque;
+
+    switch(offset)
+    {
+        //Readback protection is not implemented for QEMU
+        case O_UICR_RBPCONF: return (uint64_t)-1;
+
+        case O_UICR_CLENR0:         return s->REG.CLENR0;
+        case O_UICR_XTALFREQ:       return s->REG.XTALFREQ;
+        case O_UICR_BOOTLOADERADDR: return s->REG.BOOTLOADERADDR;
+
+        //FIXME: Not supported??
+        case O_UICR_FWID:
+        //Reserved for Nordic FW/HW design
+        case O_UICR_NRFFW1 ... O_UICR_NRFFW14:
+        case O_UICR_NRFHW1 ... O_UICR_NRFHW11:
+            return (uint64_t)-1;
+    }
+
+    fprintf(stderr, "UICR unknown reg read: 0x%llx\n", offset);
+    return (uint64_t)-1;
+}
+
+static void nrf51_uicr_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+    nrf51_uicr_state *s = opaque;
+    bool save_regs = false;
+
+    switch(offset)
+    {
+        //FIXME: mass erase
+        case O_UICR_CLENR0:
+            if (s->REG.CLENR0 == (uint32_t) - 1)
+            {
+                s->REG.CLENR0 = value;
+                save_regs = true;
+            }
+            break;
+
+        case O_UICR_XTALFREQ:
+        {
+            const uint32_t xtf = (value & 0xFF);
+            if (s->REG.XTALFREQ != xtf)
+            {
+                s->REG.XTALFREQ = xtf;
+                save_regs = true;
+            }
+            break;
+        }
+
+        case O_UICR_FWID:
+
+        //FIXME: Missing info in docs.
+        case O_UICR_BOOTLOADERADDR:
+            if (s->REG.BOOTLOADERADDR != value)
+            {
+                s->REG.BOOTLOADERADDR = value;
+                save_regs = true;
+            }
+            break;
+
+        case O_UICR_CUSTOMER0 ... O_UICR_CUSTOMER31:
+        {
+            const int idx = (offset - O_UICR_CUSTOMER0) / 4;
+            if (s->REG.CUSTOMER[idx] != value)
+            {
+                s->REG.CUSTOMER[idx] = value;
+                save_regs = true;
+            }
+        }
+        //Reserved for Nordic FW/HW design
+        case O_UICR_NRFFW1 ... O_UICR_NRFFW14:
+        case O_UICR_NRFHW1 ... O_UICR_NRFHW11:
+            break;
+
+        default:
+            fprintf(stderr, "UICR unknown reg write: 0x%llx\n", offset);
+            break;
+    }
+
+    if (save_regs)
+    {
+        nrf51_uicr_save_regs(s);
+    }
+}
 
 static uint64_t nrf51_gpio_read(void *opaque, hwaddr offset,
                                    unsigned int size)
@@ -1203,7 +1479,6 @@ static void nrf51_gpte_write(void *opaque, hwaddr offset,
 {
     nrf51_gpte_state *s = opaque;
 
-    printf("---- gpte write at 0x%x\n", offset);
     switch(offset)
     {
         //Tasks
@@ -1243,7 +1518,6 @@ static void nrf51_gpte_write(void *opaque, hwaddr offset,
 
         //Registers
         case O_GPTE_INTEN:
-            printf("set gpte inten\n");
             s->REG.INTEN = value;
             break;
 
@@ -1265,8 +1539,6 @@ static void nrf51_gpte_write(void *opaque, hwaddr offset,
             int psel;
             int idx = (offset - O_GPTE_CONFIG0) / 4;
             s->REG.CONFIG[idx] = value;
-
-            printf("---- config gpte: %d\n", idx);
 
             mode = nrf51_gpte_read_mode(s, idx);
             psel = nrf51_gpte_read_psel(s, idx);
@@ -1319,6 +1591,9 @@ static uint64_t nrf51_clock_read(void *opaque, hwaddr offset,
         case O_CLOCK_CTIV: return s->REG.CTIV;
         case O_CLOCK_XTALFREQ: return s->REG.XTALFREQ;
     }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "CLOCK: unk read at 0x%x\n", (uint32_t)offset);
+
     return (uint64_t)-1;
 }
 
@@ -1356,7 +1631,7 @@ static void nrf51_clock_write(void *opaque, hwaddr offset,
                 s->REG.LFCLKSTARTED = 1;
                 s->REG.LFCLKRUN = 1;
                 //Set running state
-                s->REG.LFCLKSTAT = 1<<16;
+                s->REG.LFCLKSTAT = CLOCK_STAT_RUNNING | (s->REG.LFCLKSRC & MASK_CLOCK_LFCLKSRC);
                 if (GET_BIT(s->REG.INTEN, BIT_CLOCK_INT_LFCLKSTARTED)){
                     qemu_irq_pulse(s->irq);
                 }
@@ -1407,7 +1682,7 @@ static void nrf51_clock_write(void *opaque, hwaddr offset,
             s->REG.INTEN &= ~value;
             break;
         case O_CLOCK_LFCLKSRC:
-            s->REG.LFCLKSRC = value & 0x3;
+            s->REG.LFCLKSRC = value & MASK_CLOCK_LFCLKSRC;
             break;
         case O_CLOCK_CTIV:
             s->REG.CTIV = value & 0x7F;
@@ -1415,14 +1690,35 @@ static void nrf51_clock_write(void *opaque, hwaddr offset,
         case O_CLOCK_XTALFREQ:
             s->REG.XTALFREQ = value & 0xFF;
             break;
+
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR, "CLOCK: unk write at 0x%x\n", (uint32_t)offset);
+            break;
     }
 
+}
+
+static int64_t get_clock_virt(void)
+{
+    return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static int64_t get_ns_per_tick(int64_t freq)
+{
+    static const uint64_t CLOCK_SCALE = 1; //10
+    return NANOSECONDS_PER_SECOND * CLOCK_SCALE / freq;
+}
+
+static double get_ns_per_tick_d(int64_t freq)
+{
+    static const double CLOCK_SCALE = 1.0;
+    return ((double)NANOSECONDS_PER_SECOND) * CLOCK_SCALE / ((double)freq);
 }
 
 static uint64_t nrf51_rtc_read(void *opaque, hwaddr offset,
                                    unsigned int size)
 {
-    const nrf51_rtc_state * s = opaque;
+    nrf51_rtc_state * s = opaque;
     switch(offset)
     {
         /* Tasks */
@@ -1430,7 +1726,7 @@ static uint64_t nrf51_rtc_read(void *opaque, hwaddr offset,
         case O_RTC_STOP:
         case O_RTC_CLEAR:
         case O_RTC_TRIGOVRFLW:
-            return 0; //TODO: Is it correct to return 0?
+            return (uint64_t) -1;
 
         /* Events */
         case O_RTC_TICK: return s->REG.TICK;
@@ -1441,7 +1737,21 @@ static uint64_t nrf51_rtc_read(void *opaque, hwaddr offset,
         case O_RTC_COMPARE3: return s->REG.COMPARE[3];
 
         /* Registers */
-        case O_RTC_COUNTER: return s->REG.COUNTER & MASK_RTC_COUNTER;
+        case O_RTC_COUNTER:
+        {
+            uint32_t ret;
+            if (s->bRunning)
+            {
+                const int64_t ns_passed = get_clock_virt() - s->rtc_begin_ns;
+                const int64_t ticks = (int64_t)((double)ns_passed / s->ns_per_tick);
+                ret = s->REG.COUNTER = ((uint32_t)ticks) & MASK_RTC_COUNTER;
+            }
+            else
+            {
+                ret = s->REG.COUNTER;
+            }
+            return ret;
+        }
         case O_RTC_PRESCALER: return s->REG.PRESCALER;
         case O_RTC_CC0: return s->REG.CC[0];
         case O_RTC_CC1: return s->REG.CC[1];
@@ -1463,35 +1773,75 @@ static uint64_t nrf51_rtc_read(void *opaque, hwaddr offset,
     return 0xffffffff;
 }
 
+static void nrf51_rtc_set_next(nrf51_rtc_state * s)
+{
+    g_assert(s->REG.COUNTER < MASK_RTC_COUNTER); //unlikely
+    uint32_t dist = (MASK_RTC_COUNTER - s->REG.COUNTER + 1); //Closest event (overflow)
+    s->next_tick = MASK_RTC_COUNTER + 1; //zero on overflow
+    for (int i = 0; i < RTC_NUM_CC_REGS; i++)
+    {
+        const uint32_t cc_dist = (s->REG.CC[i] > s->REG.COUNTER) ?
+            (s->REG.CC[i] - s->REG.COUNTER) :
+            (MASK_RTC_COUNTER - s->REG.CC[i] + s->REG.COUNTER);
+            //printf("[RTC%d] compare 0x%x vs 0x%x\n",s->num_instance, dist, cc_dist);
+            if (cc_dist < dist)
+            {
+                dist = cc_dist;
+                s->next_tick  = s->REG.CC[i];
+            }
+    }
+
+    double future = s->ns_per_tick * (double)dist;
+    const int64_t next = (int64_t) future + get_clock_virt();//s->rtc_begin_ns;
+    timer_mod_ns(s->qtimer, next);
+}
+
 static void nrf51_rtc_write(void *opaque, hwaddr offset,
                                 uint64_t value, unsigned int size)
 {
         nrf51_rtc_state * s = opaque;
 
+        qemu_mutex_lock(&s->mtx);
         switch(offset)
         {
             /* Tasks */
             case O_RTC_START:
+                g_assert(!s->bRunning); //guest error
                 if (!value || s->bRunning) //TODO: Compare '1' or any value?
                     break;
 
                 //TODO: Frequency can be different depending on the clock source
                 //Start task for counter.
-                ptimer_set_freq(s->ptimer, 32768);
-                ptimer_set_count(s->ptimer, s->REG.PRESCALER + 1);
-                ptimer_run(s->ptimer, 1);
-                printf("RTC started\n");
+                if (s->bRunning)
+                {
+                    printf("[RTC] WARNING tried to start already running RTC\n");
+                }
+
+                const int64_t guest_freq = 32768 / (s->REG.PRESCALER + 1);
+                s->ns_per_tick = get_ns_per_tick_d(guest_freq);
+                s->rtc_begin_ns = get_clock_virt();
+                s->bRunning = true;
+                nrf51_rtc_set_next(s);
+
+                printf("[RTC] started\n");
                 //TODO: Do we even need to save start?
                 break;
 
             case O_RTC_STOP:
-                if (!value || !s->bRunning)
+                if (!value)
                     break;
-                ptimer_stop(s->ptimer);
+                printf("[RTC] stopped\n");
+                s->bRunning = false;
                 break;
 
             case O_RTC_CLEAR:
+                printf("[RTC] Clear\n");
                 s->REG.COUNTER = 0;
+                if (s->bRunning)
+                {
+                    s->rtc_begin_ns = get_clock_virt();
+                    nrf51_rtc_set_next(s);
+                }
                 break;
 
             case O_RTC_TRIGOVRFLW:
@@ -1554,20 +1904,13 @@ static void nrf51_rtc_write(void *opaque, hwaddr offset,
                 s->REG.EVTEN &= ~value;
                 break;
 
-            case O_RTC_CC0:
-                s->REG.CC[0] = value;
-                break;
-
-            case O_RTC_CC1:
-                s->REG.CC[1] = value;
-                break;
-
-            case O_RTC_CC2:
-                s->REG.CC[2] = value;
-                break;
-
-            case O_RTC_CC3:
-                s->REG.CC[3] = value;
+            case O_RTC_CC0 ... O_RTC_CC3:
+                {
+                    int idx = (offset - O_RTC_CC0) / 4;
+                    s->REG.CC[idx] = value & MASK_RTC_COUNTER;
+                    s->REG.COUNTER = nrf51_rtc_read(s, O_RTC_COUNTER, 4); //TODO: when mutex used, DEADLOCK
+                    if (s->bRunning) nrf51_rtc_set_next(s);
+                }
                 break;
 
             default:
@@ -1575,56 +1918,94 @@ static void nrf51_rtc_write(void *opaque, hwaddr offset,
                 break;
         }
 
+        qemu_mutex_unlock(&s->mtx);
+}
+
+
+static void nrf51_rtc_timer(void * opaque)
+{
+    nrf51_rtc_state  * const s = opaque;
+    qemu_mutex_lock(&s->mtx); //TODO: use mutex for read as well.
+    if (!s->bRunning)
+    {
+        qemu_mutex_unlock(&s->mtx);
+        return;
+    }
+    s->REG.COUNTER = s->next_tick;
+    nrf51_rtc_tick(s);
+    const int64_t ns_passed = (int64_t) (((double)s->REG.COUNTER) * s->ns_per_tick);
+    s->rtc_begin_ns = get_clock_virt() - ns_passed;
+    nrf51_rtc_set_next(s);
+    qemu_mutex_unlock(&s->mtx);
 }
 
 static void nrf51_rtc_tick(void *opaque)
 {
     int i;
     uint32_t cc_bit;
-    nrf51_rtc_state * s = opaque;
     bool pulse = false;
+    nrf51_rtc_state * s = opaque;
 
-    s->REG.COUNTER++;
+    /*
+     * RTC has slightly different event/task system.
+     * Ref. Man. p.105 Figure 34.
+     * An event is set if the event is enabled (EVTEN) or the interrupt (INTEN).
+     */
     if (s->REG.COUNTER > MASK_RTC_COUNTER)
     {
         s->REG.COUNTER = 0;
-        s->REG.OVRFLW = 1;
-        pulse = true;
+
+        if (s->REG.EVTEN & MASK_RTC_INTEN_OVERFLW)
+        {
+            s->REG.OVRFLW = 1;
+            ppi_event_filter(s->base + O_RTC_OVRFLW);
+        }
+
+        if (s->REG.INTEN & MASK_RTC_INTEN_OVERFLW)
+        {
+            s->REG.OVRFLW = 1;
+            pulse = true;
+            puts("rtc irq overflw");
+        }
     }
 
-    //TODO: Check event routing register when PPI is implemented. p.105, figure 36
+    if (s->REG.EVTEN & MASK_RTC_INTEN_TICK)
+    {
+        s->REG.TICK = 1;
+        ppi_event_filter(s->base + O_RTC_TICK);
+    }
+
     if (s->REG.INTEN & MASK_RTC_INTEN_TICK)
     {
         s->REG.TICK = 1;
         pulse = true;
+        puts("rtc irq tick");
     }
 
-    //Check for all compare events if ANY compare is enabled.
-    //but only trigger enabled ones.
-    if ( s->REG.INTEN & (MASK_RTC_INTEN_ALLCOMPARE) )
+    for (i = 0, cc_bit = MASK_RTC_INTEN_COMPARE0; i < RTC_NUM_CC_REGS; i++)
     {
-        for(i = 0, cc_bit = MASK_RTC_INTEN_COMPARE0; i < RTC_NUM_CC_REGS; i++)
+        if (s->REG.CC[i] == s->REG.COUNTER) //Does COUNTER match CC?
         {
+            if (s->REG.EVTEN & cc_bit)
+            {
+                s->REG.COMPARE[i] = 1;
+                ppi_event_filter(s->base + O_RTC_COMPARE0 + i * 4);
+            }
+
             if (s->REG.INTEN & cc_bit) //Is event enabled?
             {
-                if (s->REG.CC[i] == s->REG.COUNTER) //Does COUNTER match CC?
-                {
-                    s->REG.COMPARE[i] = 1;
-                    pulse = true;
-                }
+                s->REG.COMPARE[i] = 1;
+                pulse = true;
             }
-            //COMPARE0..COMPARE4 bits in INTENT register are adjacent.
-            //Checking bits from 16 to 19.
-            cc_bit <<= 1;
         }
+        //COMPARE0..COMPARE4 bits in INTENT register are adjacent.
+        //Checking bits from 16 to 19.
+        cc_bit <<= 1;
     }
 
     if (pulse)
         qemu_irq_pulse(s->irq);
 
-    ptimer_set_count(s->ptimer, s->REG.PRESCALER + 1);
-    ptimer_run(s->ptimer, 1);
-    //printf("rtc tick: %u\n", s->REG.COUNTER & MASK_RTC_COUNTER);
 }
 
 static uint64_t nrf51_adc_read(void *opaque, hwaddr offset,
@@ -1955,7 +2336,7 @@ static void nrf51_uart_write(void *opaque, hwaddr offset,
         case O_UART_STOPTX:
             if (value){
                 s->uTimerTaskFlags &= ~UART_STARTTX_TASK;
-                printf("Stop TX\n");
+                //printf("Stop TX\n");
             }
             break;
 
@@ -2125,18 +2506,975 @@ static void nrf51_rng_write(void *opaque, hwaddr offset,
     }
 }
 
+static void nrf51_timer_qtick(void * opaque)
+{
+    nrf51_timer_state * const s = opaque;
+    if (!s->task_started)
+    {
+        return;
+    }
+
+#if TIMER_LOG_ENABLED
+    const uint32_t mask = nrf51_timer_getmask(s);
+    const int64_t clock_now = get_clock_virt() - s->clock_begin;
+    const int64_t gclock_now = (clock_now - s->clock_begin) / s->ns_per_tick;
+    const uint32_t gclock_masked = gclock_now & mask;
+
+    printf("qtick\n");
+    printf("gclock masked: %u\n", gclock_masked);
+    printf("reg cc[0]: %u\n", s->REG.CC[0] & mask);
+#endif
+
+    /*
+     * timer_tick function simulates each timer tick.
+     * Since TIMER module works in two modes (counter and timer)
+     * Timer mode is simulated by QEMU timers.
+     * Counter mode only requires timer_tick function to be called.
+     * It increments (s->tick) by one and checks for compare registers.
+     * It is not feasible to call timer_tick function 16M times a second
+     * for timer mode. So we only call it when it is required by calculating
+     * next trigger time and with the help of QEMU timers.
+     * We only give the previous value for tick, timer_tick increases the value
+     * then does its job.
+     * 
+     * It is enough to pass last CC value used for the comparison.
+     */
+    s->tick = (s->cc_used - 1);
+    nrf51_timer_tick(s);
+
+    if (s->task_started)
+    {
+        s->clock_begin = get_clock_virt();
+        nrf51_timer_set_next_event(s);
+    }
+}
+
+static uint32_t nrf51_timer_getmask(nrf51_timer_state * s)
+{
+    static const uint32_t bitmode_mask[TIMER_NUM_CC_REGS] =
+    {
+        [0] = 0xFFFF,     //16 bit
+        [1] = 0xFF,       //8 bit
+        [2] = 0xFFFFFF,   //24 bit
+        [3] = 0xFFFFFFFF  //32 bit
+    };
+
+    //printf("[TIMER%d] using BITMODE: %u\n", s->num_instance, (uint32_t) s->REG.BITMODE);
+    g_assert((s->counter_max & 0xFF) == 0xFF);
+    return bitmode_mask[s->REG.BITMODE & 0x3] & s->counter_max;
+}
+
+static int64_t nrf51_timer_set_next_event(nrf51_timer_state * s)
+{
+    const uint32_t mask = nrf51_timer_getmask(s);
+    const uint32_t cc[TIMER_NUM_CC_REGS] =
+    {
+        //Mask and save each CC register.
+        s->REG.CC[0] & mask,
+        s->REG.CC[1] & mask,
+        s->REG.CC[2] & mask,
+        s->REG.CC[3] & mask,
+    };
+
+    g_assert(s->ns_per_tick > 0);
+    //relative to the guest's timer clock
+    //const int64_t clock_now = get_clock_virt();
+    const int64_t gclock_now = s->tick; //(clock_now - s->clock_begin) / s->ns_per_tick;
+    const uint32_t gclock_masked = gclock_now & mask;
+    int64_t closest = ((uint32_t) -1);
+
+    for (int i = 0; i < TIMER_NUM_CC_REGS; i++)
+    {
+        uint32_t dist;
+        if (cc[i] > gclock_masked)
+        {
+            dist = cc[i] - gclock_masked;
+        }
+        else
+        {
+            dist = mask - gclock_masked + cc[i];
+        }
+
+        if (dist < closest)
+        {
+            closest = dist;
+            s->cc_used = cc[i];
+        }
+    }
+
+    const int64_t next_event_time = s->clock_begin + closest * s->ns_per_tick;
+
+#if TIMER_LOG_ENABLED
+    printf("[TIMER%d] using cc value: %u (mask 0x%x)\n",
+            s->num_instance, s->cc_used, mask);
+    printf("host clock begin: %lld\n", s->clock_begin);
+    //printf("host clock now:   %lld\n", clock_now);
+    printf("guest tick now:   %lld\n", gclock_now);
+    printf("guest closest tick: %lld\n", closest);
+    printf("next event time in ns: %lld\n", next_event_time);
+    printf("[TIMER%d] closest event (ms): %lld\n",
+           s->num_instance, (next_event_time - s->clock_begin) / SCALE_MS);
+#endif
+
+    timer_mod_ns(s->qtimer, next_event_time);
+
+    return next_event_time;
+}
+
+static void nrf51_timer_tick(void * opaque)
+{
+    nrf51_timer_state * const s = opaque;
+
+    if (!s->task_started)
+    {
+        /*
+         * STOP task must have been triggered
+         * or START task was never triggered.
+         */
+        return;
+    }
+
+    const uint32_t mask = nrf51_timer_getmask(s);
+    ++s->tick;
+    const uint32_t tick_masked = s->tick & mask;
+    const uint32_t cc[TIMER_NUM_CC_REGS] =
+    {
+        //Mask and save each CC register.
+        s->REG.CC[0] & mask,
+        s->REG.CC[1] & mask,
+        s->REG.CC[2] & mask,
+        s->REG.CC[3] & mask,
+    };
+
+    bool pulse = false;
+
+    //printf("tick: %u masked: %u\n", s->tick, tick_masked);
+
+    for (int i = 0; i < TIMER_NUM_CC_REGS; i++)
+    {
+        if (cc[i] == tick_masked)
+        {
+#if TIMER_LOG_ENABLED
+            printf("CC[%d]: %u, tick_masked: %u\n", i, cc[i], tick_masked);
+#endif
+            const uint8_t short_mask = (1 << i);
+            s->REG.COMPARE[i] = 1; //Set event
+#if TIMER_LOG_ENABLED
+            printf("[TIMER%d] evt COMPARE[%d]\n", s->num_instance, i);
+#endif
+            ppi_event_filter(s->base + O_TIMER_COMPARE0 + i*4);
+
+            //Check for CLEAR and STOP shortcuts
+            if (s->REG.SHORTS & short_mask)
+            {
+#if TIMER_LOG_ENABLED
+                printf("[TIMER%d] COMPARE -> CLEAR\n", s->num_instance);
+#endif
+                nrf51_timer_write(s, O_TIMER_CLEAR, 1, sizeof(uint32_t));
+            }
+
+            if ( (s->REG.SHORTS >> 4) & short_mask )
+            {
+#if TIMER_LOG_ENABLED
+                printf("[TIMER%d] COMPARE -> STOP\n", s->num_instance);
+#endif
+                nrf51_timer_write(s, O_TIMER_STOP, 1, sizeof(uint32_t));
+            }
+
+            //Check for INTEN flag
+            if ( (s->REG.INTEN >> 16) & short_mask )
+            {
+                pulse = true;
+            }
+        }
+    }
+
+    if (pulse)
+        qemu_irq_pulse(s->irq);
+
+}
+
 static uint64_t nrf51_timer_read(void *opaque, hwaddr offset,
                           unsigned int size)
 {
-    //nrf51_timer_state *s = opaque;
+    nrf51_timer_state *s = opaque;
 
+    switch(offset)
+    {
+        case O_TIMER_SHORTS:    return s->REG.SHORTS;
+        case O_TIMER_MODE:      return s->REG.MODE;
+        case O_TIMER_BITMODE:   return s->REG.BITMODE;
+        case O_TIMER_PRESCALER: return s->REG.PRESCALER;
+
+        case O_TIMER_INTENSET:
+        case O_TIMER_INTENCLR:
+            return s->REG.INTEN;
+
+        case O_TIMER_CC0 ... O_TIMER_CC3:
+            return s->REG.CC[(offset - O_TIMER_CC0) / 4];
+
+        //Events
+        case O_TIMER_COMPARE0 ... O_TIMER_COMPARE3:
+            return s->REG.COMPARE[(offset - O_TIMER_COMPARE0) / 4];
+
+    }
+
+    fprintf(stderr, "TIMER rd unknown reg: 0x%x\n", (uint32_t) offset);
     return (uint64_t)-1;
 }
 
 static void nrf51_timer_write(void *opaque, hwaddr offset,
                        uint64_t value, unsigned int size)
 {
+    nrf51_timer_state *s = opaque;
+    //printf("[TIMER%d] wr 0x%x := 0x%x\n", s->num_instance, (uint32_t) offset, (uint32_t) value);
+    switch(offset)
+    {
+        /* Tasks */
+        case O_TIMER_START:
+        {
+            //By default prescaler is not used for COUNTER mode
+            uint16_t prescaler = 0;
+            s->task_started = true;
 
+            if (s->REG.MODE != TIMER_MODE_TIMER)
+            {
+                printf("[TIMER%d] started in COUNTER mode\n", s->num_instance);
+                break;
+            }
+
+            prescaler = s->REG.PRESCALER & 0xF;
+            if (prescaler > 9)
+            {
+                prescaler = 9;
+                //TODO: Check behavior on device.
+                qemu_log_mask(LOG_GUEST_ERROR, "timer prescaler set to %u, using max (9)\n", prescaler);
+            }
+            prescaler = 1 << prescaler;
+            const uint32_t guest_freq = FREQ_16MHZ / prescaler;
+            s->ns_per_tick = get_ns_per_tick(guest_freq);
+            s->clock_begin = get_clock_virt();
+            const int64_t next_event_time = nrf51_timer_set_next_event(s);
+#if TIMER_LOG_ENABLED
+            printf("guest frequency: %u, ns/tick: %u\n", guest_freq, s->ns_per_tick);
+            printf("next event time: %lld\n", next_event_time);
+#else
+            (void)next_event_time;
+#endif
+            break;
+        }
+
+        case O_TIMER_SHUTDOWN:
+            s->tick = 0;
+            //fall through
+        case O_TIMER_STOP:
+            s->task_started = false;
+            timer_del(s->qtimer);
+            break;
+
+        case O_TIMER_COUNT:
+            if (s->REG.MODE == TIMER_MODE_COUNTER && s->task_started)
+            {
+                nrf51_timer_tick(s);
+            }
+            break;
+
+        case O_TIMER_CAPTURE0 ... O_TIMER_CAPTURE3:
+        {
+            g_assert(s->REG.MODE == TIMER_MODE_TIMER || s->REG.MODE == TIMER_MODE_COUNTER);
+            const int cc_idx = (offset - O_TIMER_CAPTURE0) / 4;
+            if (s->REG.MODE == TIMER_MODE_TIMER)
+            {
+                if (s->task_started)
+                {
+                    //Only capture the value if START task was triggered before.
+                    g_assert(s->ns_per_tick > 0);
+                    s->REG.CC[cc_idx] =
+                        (get_clock_virt() / s->ns_per_tick) &
+                        nrf51_timer_getmask(s);
+                }
+            }
+            else
+            {
+                //Counter mode
+                s->REG.CC[cc_idx] = s->tick;
+                //printf("[TIMER] counter capture: %u\n", s->tick);
+            }
+
+            break;
+        }
+
+        case O_TIMER_CLEAR:
+            s->tick = 0;
+            if (s->REG.MODE == TIMER_MODE_TIMER)
+            {
+                if (s->task_started)
+                {
+                   /*
+                    * It is needed to clear counter value but
+                    * in timer mode we do not count ticks.
+                    * Instead we use QEMU timers for performance
+                    * concerns.
+                    * So let's just restart the timer by this recursive call.
+                    * This will also modify existing QEMU timer.
+                    */
+                    //printf("[TIMER%d] clear\n", s->num_instance);
+                    timer_del(s->qtimer);
+                    nrf51_timer_write(s, O_TIMER_START, 1, sizeof(uint32_t));
+                }
+            }
+            break;
+
+        /* Registers */
+        case O_TIMER_SHORTS:
+            s->REG.SHORTS = value;
+            break;
+
+        case O_TIMER_INTENSET:
+            s->REG.INTEN |= value;
+            break;
+
+        case O_TIMER_INTENCLR:
+            s->REG.INTEN &= ~value;
+            break;
+
+        case O_TIMER_MODE:
+            s->REG.MODE = value & 0x1;
+            break;
+
+        //TODO: unpredictible behavior on device if updated when timer is running.
+        case O_TIMER_BITMODE:
+            s->REG.BITMODE = value;
+            break;
+
+        //TODO: unpredictible behavior on device if updated when timer is running.
+        case O_TIMER_PRESCALER:
+            s->REG.PRESCALER = value;
+            break;
+
+        //TODO: Is this supposed to be RW?
+        case O_TIMER_CC0 ... O_TIMER_CC3:
+            //TODO: need to recalculate next timer event?
+            s->REG.CC[(offset - O_TIMER_CC0) / 4] = value;
+            if (s->task_started)
+            {
+                //Calculate the next event time if timer was started.
+                (void) nrf51_timer_set_next_event(s);
+            }
+            break;
+
+        //Events
+        case O_TIMER_COMPARE0 ... O_TIMER_COMPARE3:
+            s->REG.COMPARE[(offset - O_TIMER_COMPARE0) / 4] = value;
+            break;
+
+        default:
+            fprintf(stderr, "TIMER unknown reg: 0x%x\n", (uint32_t) offset);
+            break;
+    }
+}
+
+static uint64_t nrf51_ficr_read(void *opaque, hwaddr offset,
+                          unsigned int size)
+{
+    //nrf51_ficr_state *s = opaque;
+
+    switch(offset)
+    {
+        case O_FICR_CODEPAGESIZE: return NRF51_CODEPAGESIZE;
+
+        case O_FICR_CODESIZE: return NRF51_CODESIZE;
+
+        case O_FICR_CLENR0:
+            return (uint64_t) -1; //TODO: Check UICR CLENR0 config.
+
+        case O_FICR_PPFC: return 0xFF; //Not present
+
+        case O_FICR_NUMRAMBLOCK: return NUMRAMBLOCK; //4 blocks
+
+        case O_FICR_SIZERAMBLOCK1: //Deprecated
+        case O_FICR_SIZERAMBLOCK2: //Deprecated
+        case O_FICR_SIZERAMBLOCK3: //Deprecated
+        case O_FICR_SIZERAMBLOCKS:
+            return SIZERAMBLOCKS;
+
+        //Hardcoded, HWID = 0x86; FWID = deprecated.
+        case O_FICR_CONFIGID: return 0xffff0086; 
+
+        //Hardcoded Device ID.
+        //FIXME: Use device id from command line
+        case O_FICR_DEVICEID0: return DEVICEID_LO;
+        case O_FICR_DEVICEID1: return DEVICEID_HI;
+
+        case O_FICR_DEVICEADDR0:
+        {
+            static uint8_t r;
+            while(!r)
+            {
+                r = xsrand();
+            }
+            return DEVICEADDR_LO + r;
+        }
+        case O_FICR_DEVICEADDR1: return DEVICEADDR_HI;
+
+        case O_FICR_DEVICEADDRTYPE: return DEVICEADDRTYPE_RANDOM;
+
+        //TODO: unsupported
+        case O_FICR_ER0 ... O_FICR_ER3:
+            return (uint64_t) -1;
+
+    }
+
+    printf("ficr, not implemented: 0x%llx\n", offset);
+
+    return (uint64_t)-1;
+}
+
+static void nrf51_ficr_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+
+}
+
+static uint64_t nrf51_wdt_read(void *opaque, hwaddr offset,
+                          unsigned int size)
+{
+    nrf51_wdt_state * const s = opaque;
+
+    switch (offset)
+    {
+        case O_WDT_INTENSET:
+        case O_WDT_INTENCLR:
+            return s->REG.INTEN;
+
+        case O_WDT_RR0 ... O_WDT_RR7:
+            return WDT_RELOAD_VALUE;
+
+        case O_WDT_CRV:       return s->REG.CRV;
+        case O_WDT_RUNSTATUS: return s->REG.RUNSTATUS;
+        case O_WDT_REQSTATUS: return s->REG.REQSTATUS;
+        case O_WDT_RREN:      return s->REG.RREN;
+
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "WDT: read at bad offset 0x%x\n", (uint32_t)offset);
+    return (uint64_t)-1;
+}
+
+static void nrf51_wdt_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+    nrf51_wdt_state * const s = opaque;
+
+    switch (offset)
+    {
+        case O_WDT_INTENSET:
+            s->REG.INTEN |= value;
+            break;
+
+        case O_WDT_INTENCLR:
+            s->REG.INTEN &= ~value;
+            break;
+        
+        case O_WDT_RREN:
+            if (!s->started)
+            {
+                s->REG.RREN = value;
+            }
+            break;
+
+        case O_WDT_CRV:
+            if (!s->started)
+            {
+                s->REG.CRV = value;
+            }
+            break;
+
+        case O_WDT_CONFIG:
+            if (!s->started)
+            {
+                s->REG.CONFIG = value;
+            }
+            break;
+
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR,
+                "WDT: write at bad offset 0x%x\n", (uint32_t)offset);
+            break;
+    }
+}
+
+static uint64_t nrf51_ccm_read(void *opaque, hwaddr offset,
+                          unsigned int size)
+{
+    nrf51_ccm_state *s = opaque;
+
+
+    switch (offset)
+    {
+        case O_CCM_SCRATCHPTR: return s->REG.SCRATCHPTR;
+        case O_CCM_CNFPTR    : return s->REG.CNFPTR;
+        case O_CCM_INPTR     : return s->REG.INPTR;
+        case O_CCM_OUTPTR    : return s->REG.OUTPTR;
+        case O_CCM_ENDKSGEN  : return s->REG.ENDKSGEN;
+        case O_CCM_ENDCRYPT  : return s->REG.ENDCRYPT;
+        case O_CCM_ERROR     : return s->REG.ERROR;
+        case O_CCM_ENABLE    : return s->REG.ENABLE;
+        case O_CCM_MODE      : return s->REG.MODE;
+        case O_CCM_MICSTATUS : return 1;//s->REG.MICSTATUS;
+
+
+        case O_CCM_INTENSET:
+        case O_CCM_INTENCLR:
+            return s->REG.INTEN;
+
+    default:
+        break;
+    }
+
+    return (uint64_t)-1;
+}
+
+static inline uint8_t get_ccm_inptr_tot_len(uint8_t * pkt_ptr)
+{
+    return get_ccm_len(pkt_ptr) + 3; /* hdr + len + rfu */
+}
+
+static uint8_t * nrf51_ccm_ptr_to_ram(nrf51_ccm_state * s, uint32_t ptr, uint32_t minimum)
+{
+    uint8_t * const ram_ptr = memory_region_get_ram_ptr(&bootinfo.sram);
+    uint8_t * pkt_ptr;
+    if (ptr < NRF51_SRAM_BASE)
+    {
+        return NULL;
+    }
+    ptr -= NRF51_SRAM_BASE;
+    if (ptr >= SRAM_32K)
+    {
+        return NULL;
+    }
+
+    pkt_ptr = ram_ptr + ptr;
+
+    if (!minimum)
+    {
+        minimum = get_ccm_inptr_tot_len(pkt_ptr);
+    }
+
+    if (ptr + minimum >= SRAM_32K)
+    {
+        return NULL;
+    }
+
+    return pkt_ptr;
+}
+
+/*
+ * Implemented according to Bluetooth Specification v4.0
+ * Specification Volume 6 (Core System Package) / Part E / 2.1 CCM Nonce
+ */
+static bool nrf51_ccm_gen_nonce(nrf51_ccm_state * s)
+{
+    uint8_t * const ram_ptr = memory_region_get_ram_ptr(&bootinfo.sram);
+    uint32_t cnfptr = s->REG.CNFPTR;
+    if (cnfptr < NRF51_SRAM_BASE || (cnfptr & 0x3)) //Check that 32-bit aligned.
+    {
+        fprintf(stderr, "ccm cnfptr lower than sram base\n");
+        return false;
+    }
+    cnfptr -= NRF51_SRAM_BASE;
+    if (cnfptr > (SRAM_32K - sizeof(ccm_cnf_t)))
+    {
+        fprintf(stderr, "ccm cnfptr out of sram bounds\n");
+        return false;
+    }
+
+    //FIXME: Reading cnf on different host platform might cause faults. (unaligned read)
+    ccm_cnf_t * cnf = (void*)(ram_ptr + cnfptr);
+
+    const uint8_t * pktctr = (uint8_t*) &cnf->pktctr;
+    hexdump("pktctr", pktctr, 5);
+    s->nonce[0] = pktctr[0];
+    s->nonce[1] = pktctr[1];
+    s->nonce[2] = pktctr[2];
+    s->nonce[3] = pktctr[3];
+    s->nonce[4] = pktctr[4] & 0x7f;
+    s->nonce[4] |= cnf->direction_bit << 7;
+#define CCM_IV_OFFSET (5) //FIXME: move
+    memcpy(s->nonce + CCM_IV_OFFSET, cnf->iv, sizeof(s->nonce) - CCM_IV_OFFSET);
+    memcpy(s->key, cnf->key, sizeof(s->key));
+    QEMU_BUILD_BUG_ON(sizeof(s->nonce) - CCM_IV_OFFSET != sizeof(cnf->iv));
+
+    hexdump("nonce", s->nonce, sizeof(s->nonce));
+    return true;
+}
+
+static void nrf51_ccm_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+    nrf51_ccm_state * s = opaque;
+    CCMDP("wr 0x%x := 0x%x", (uint32_t) offset, (uint32_t) value);
+    switch (offset)
+    {
+        case O_CCM_CRYPT:
+            {
+                bool error = false;
+                uint8_t * inptr = nrf51_ccm_ptr_to_ram(s, s->REG.INPTR, 0);
+                uint8_t * outptr = nrf51_ccm_ptr_to_ram(s, s->REG.OUTPTR, get_ccm_inptr_tot_len(inptr) + NRF51_MIC_SZ);
+                uint8_t * sc_ptr = nrf51_ccm_ptr_to_ram(s, s->REG.SCRATCHPTR, AES_CCM_SCRATCH_SZ);
+                if (inptr && outptr && sc_ptr)
+                {
+                    outptr[0] = get_ccm_hdr(inptr); //copy header
+                    outptr[1] = inptr[1] + NRF51_MIC_SZ; //Adjust len
+                    outptr[2] = 0; //RFU
+                    uint8_t * mic_ptr = get_ccm_data_ptr(outptr) + get_ccm_len(inptr); //dataptr + inputlen
+                    /*
+                     * Note:
+                     * CCM can authenticate unencrypted data, which is the additional authenticated data (AAD).
+                     * In that case, a single byte header is calculated as AAD.
+                     * It is transmitted unecrypted but is also authenticated. 
+                     */
+                    const int ret = aes_ccm_ae(s->key, AES_ECB_BLOCK_SZ, s->nonce, NRF51_MIC_SZ,
+                                                get_ccm_data_ptr(inptr), get_ccm_len(inptr),
+                                                inptr /* AAD */, 1 /* AAD Len */, get_ccm_data_ptr(outptr), mic_ptr);
+                    if (!(error = ret))
+                    {
+                        //TODO: Check inten and irq pulse
+                        s->REG.ENDCRYPT = 1;
+                        printf("crypt done\n");
+                    }
+                }
+                else
+                {
+                    error = true;
+                }
+                if (error)
+                {
+                    //TODO: gen irq (check inten)
+                    s->REG.ERROR = 1;
+                }
+            }
+            break;
+        case O_CCM_KSGEN:
+            if(nrf51_ccm_gen_nonce(s))
+            {
+                s->REG.ENDKSGEN = 1;
+                //TODO: irq
+                /*
+                if (s->REG.INTEN & mask)
+                {
+                    qemu_irq_pulse(s->irq)
+                }
+                */
+                //TODO: short
+                /*
+                if (s->REG.SHORTS & 0x1) //endksgen_crypt
+                {
+                    call crypt
+                }
+                */
+            }
+            else
+            {
+                //TODO: Trigger error event (check RM)
+                s->REG.ERROR = 1;
+            }
+            break;
+
+        case O_CCM_ENDKSGEN:
+            s->REG.ENDKSGEN = value;
+            break;
+        case O_CCM_ENDCRYPT:
+            s->REG.ENDCRYPT = value;
+            break;
+        case O_CCM_ERROR:
+            s->REG.ERROR = value;
+            break;
+        case O_CCM_ENABLE:
+            s->REG.ENABLE = value;
+            break;
+        case O_CCM_MODE:
+            s->REG.MODE = value;
+            break;
+        case O_CCM_CNFPTR:
+            s->REG.CNFPTR = value;
+            break;
+        case O_CCM_INPTR:
+            s->REG.INPTR = value;
+            break;
+        case O_CCM_OUTPTR:
+            s->REG.OUTPTR = value;
+            break;
+        case O_CCM_SCRATCHPTR:
+            s->REG.SCRATCHPTR = value;
+            break;
+       case O_CCM_INTENSET:
+            s->REG.INTEN |= value;
+            break;
+        case O_CCM_INTENCLR:
+            s->REG.INTEN &= ~value;
+            break;
+        default:
+            break;
+    }
+}
+
+static uint64_t nrf51_ppi_read(void *opaque, hwaddr offset,
+                          unsigned int size)
+{
+    //nrf51_ppi_state *s = opaque;
+
+    switch (offset)
+    {
+        case O_PPI_CHEN:
+        case O_PPI_CHENSET:
+        case O_PPI_CHENCLR:
+            return ppis.REG.CHEN;
+    }
+
+    qemu_log_mask(LOG_GUEST_ERROR, "PPI: unk read at 0x%x\n", (uint32_t)offset);
+    return (uint64_t)-1;
+}
+
+static bool ppi_evt_compare(const void *obj, const void *userp)
+{
+    const ppi_event_info * const evinfo = obj;
+    const uint32_t * const event_addr = userp;
+
+    return (evinfo->addr == *event_addr);
+}
+
+static ppi_event_info * nrf51_ppi_find_event(uint32_t event_addr)
+{
+    return qht_lookup(ppis.event_map, ppi_evt_compare, &event_addr, event_addr);
+}
+
+static bool ppi_is_chan_enabled(uint8_t chan)
+{
+    const uint32_t chbit = (1<<chan);
+    return !!(ppis.REG.CHEN & chbit); //check that ch. is enabled.
+}
+
+static void ppi_event_filter(uint32_t event_addr)
+{
+    ppi_event_info * evinfo = nrf51_ppi_find_event(event_addr);
+
+    PPIDP("%s event: %s\n", evinfo ? "" : " ignore", eptostr(event_addr));
+
+    if (event_addr < 0x4000000)
+    {
+        fprintf(stderr, "invalid event: 0x%x\n", event_addr);
+        g_assert(event_addr >= 0x4000000);
+        return;
+    }
+
+    if (evinfo)
+    {
+        g_assert(evinfo->ref_cnt > 0);
+        for (int i = 0; i < evinfo->ref_cnt; i++)
+        {
+            const uint8_t chan = evinfo->channels[i];
+            //Trigger the configured task for every channel, if enabled.
+            if (ppi_is_chan_enabled(chan))
+            {
+                const uint32_t tep = ppis.REG.CH[chan].TEP;
+                if (chan < 16)
+                {
+                    g_assert(event_addr == ppis.REG.CH[chan].EEP);
+                }
+                g_assert(tep > 0x40000000); //sanity check
+                if (tep != 0x4000800c)
+                {
+                    PPIDP("trigger task: %s (from: %s)\n", eptostr(tep), eptostr(event_addr));
+                }
+                g_assert(tep); //FIXME: not a QEMU development error, use warning.
+                uint32_t dummy = 1;
+                if (event_addr == 0x40008140)
+                {
+                    PPIDP("TIMER0_COMPARE0 (ch: %u), TEP: %s\n", chan, eptostr(tep));
+                }
+                //This will call write op from the corresponding peripheral
+                address_space_write(&address_space_memory, tep,
+                                    MEMTXATTRS_UNSPECIFIED,
+                                    (uint8_t*)&dummy, sizeof(dummy));
+            }
+            else if (chan < 16 || chan == 20)
+            {
+                PPIDP("Chan %u disabled, skip E/T: %s/%s\n",
+                    chan, eptostr(event_addr), eptostr(ppis.REG.CH[chan].TEP));
+            }
+        }
+    }
+}
+
+static void ppi_add_event(uint8_t chan, uint32_t eep, uint32_t tep)
+{
+    ppi_event_info * evinfo = nrf51_ppi_find_event(eep);
+    if (!evinfo)
+    {
+        //This event was not configured before.
+        evinfo = g_new0(ppi_event_info, 1);
+        evinfo->addr = eep;
+        qht_insert(ppis.event_map, evinfo, eep);
+    }
+
+    g_assert(evinfo);
+    //Add this channel into the list of channels for this event.
+    evinfo->channels[evinfo->ref_cnt++] = chan;
+    ppis.REG.CH[chan].EEP = eep;
+    PPIDP("add event %s at chan: %d (total chans for this event: %d)\n",
+            eptostr(eep), chan, evinfo->ref_cnt);
+
+    if (tep)
+    {
+        ppis.REG.CH[chan].TEP = tep;
+        PPIDP(" task %s at chan: %d\n", eptostr(tep), chan);
+    }
+}
+
+void nrf51_radio_event_ready_ppi(void)
+{
+    ppi_event_filter(RADIO_BASE + O_RADIO_READY);
+}
+
+static void nrf51_ppi_remove_chan_from_event(ppi_event_info * evinfo, uint8_t chan)
+{
+    g_assert(evinfo->ref_cnt > 0);
+    g_assert(evinfo->ref_cnt <= (PPI_NUM_USER_CHANS + PPI_NUM_FIXED_CHANS));
+    bool removed = false;
+
+    //TODO: remove this?
+    if (evinfo->ref_cnt > (PPI_NUM_USER_CHANS + PPI_NUM_FIXED_CHANS))
+    {
+        fprintf(stderr, "development error in PPI\n");
+        return;
+    }
+
+    for (int i = 0; i < evinfo->ref_cnt; i++)
+    {
+        if (evinfo->channels[i] == chan)
+        {
+            //Replace the removed event with the last one in the array.
+            //Then reduce the ref. count.
+            const uint8_t last = evinfo->channels[evinfo->ref_cnt - 1];
+            evinfo->channels[i] = last;
+            evinfo->ref_cnt--;
+            removed = true;
+            break;
+        }
+    }
+
+    //Check that this event was configured for the given channel previously.
+    g_assert(removed);
+
+    if (evinfo->ref_cnt <= 0)
+    {
+        qht_remove(ppis.event_map, evinfo, evinfo->addr);
+        g_free(evinfo);
+        return;
+    }
+}
+
+static void nrf51_ppi_write(void *opaque, hwaddr offset,
+                       uint64_t value, unsigned int size)
+{
+    //nrf51_ppi_state *s = opaque;
+
+    switch (offset)
+    {
+        //Tasks
+        case O_PPI_CHG_0_EN ... O_PPI_CHG_3_DIS:
+        {
+            offset = offset - O_PPI_CHG_0_EN;
+            const int num_chg = offset / 8;
+            if(!(offset & 0x4)) //mod 8
+            {
+                PPIDP("task chan group enable: %d\n", num_chg);
+                //Enable channels in channel group n
+                ppis.REG.CHEN |= ppis.REG.CHG[num_chg];
+            }
+            else
+            {
+                PPIDP("task chan group disable: %d\n", num_chg);
+                //Disable channels in channel group n
+                ppis.REG.CHEN &= ~ppis.REG.CHG[num_chg];
+            }
+            PPIDP("new CHEN: 0x%x\n", ppis.REG.CHEN);
+            break;
+        }
+
+        //Registers
+        case O_PPI_CHEN:
+            ppis.REG.CHEN = value;
+            PPIDP("CHEN 0x%x\n", ppis.REG.CHEN);
+            break;
+
+        case O_PPI_CHENSET:
+            ppis.REG.CHEN |= value;
+            PPIDP("CHEN 0x%x\n", ppis.REG.CHEN);
+            break;
+
+        case O_PPI_CHENCLR:
+            ppis.REG.CHEN &= ~value;
+            PPIDP("CHEN 0x%x\n", ppis.REG.CHEN);
+            break;
+
+        case O_PPI_CH_0_EEP ... O_PPI_CH_15_TEP:
+        {
+            offset = offset - O_PPI_CH_0_EEP;
+            const int num_chan = offset / 8;
+            g_assert(num_chan < 16);
+
+            //TODO: warn user if any CHG is already enabled?
+
+            if (offset & 0x4)
+            {
+                //Offset is TEP
+
+                //FIXME: (Sanity check) Need to see if TEP points to a task.
+                ppis.REG.CH[num_chan].TEP = value;
+                PPIDP("Chan %d set task: 0x%x\n", num_chan, (uint32_t)value);
+            }
+            else
+            {
+                //Offset is EEP
+
+                //FIXME: (Sanity check) Need to see if EEP points to an event.
+
+                if (ppis.REG.CH[num_chan].EEP != value)
+                {
+                    if(ppis.REG.CH[num_chan].EEP)
+                    {
+                        //We MUST have a previous event configured in this channel.
+                        ppi_event_info * old_evinfo = nrf51_ppi_find_event(ppis.REG.CH[num_chan].EEP);
+                        g_assert(old_evinfo);
+                        nrf51_ppi_remove_chan_from_event(old_evinfo, (uint8_t) num_chan);
+
+                        //old_evinfo now may point to freed memory area and can not be used.
+                        //assume old_evinfo = NULL;
+                    }
+
+                    ppi_add_event(num_chan, (uint32_t) value, 0x0);
+                }
+                else
+                {
+                    PPIDP("info: Same EEP written twice.\n");
+                }
+            }
+        }
+        break;
+
+        case O_PPI_CHG_0 ... O_PPI_CHG_3:
+        {
+            int num_chg = (offset - O_PPI_CHG_0) / 4;
+            ppis.REG.CHG[num_chg] = value;
+            PPIDP("CHG[%d] = 0x%x\n", num_chg, (uint32_t) value);
+        }
+        break;
+
+        default:
+            qemu_log_mask(LOG_GUEST_ERROR, "PPI: unk write at 0x%x\n", (uint32_t)offset);
+    }
 }
 
 static void nrf51_ecb_init(Object *obj)
@@ -2220,7 +3558,6 @@ static void nrf51_rtc_init(Object *obj)
     static char dev_name[] = "mod-rtcX";
     nrf51_rtc_state *s = NRF51_RTC_STATE(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
-    QEMUBH *bh;
 
     INIT_DEV_STATE(s);
 
@@ -2232,13 +3569,14 @@ static void nrf51_rtc_init(Object *obj)
 
     sysbus_init_mmio(sbd, &s->iomem);
 
+    s->base = (uint32_t) RTC_BASE_IRQ_LIST[num_rtc_instance].base;
     s->irq = qdev_get_gpio_in(nvic, RTC_BASE_IRQ_LIST[num_rtc_instance].irq);
 
     //Periodic timer to track RTC's counter value.
-    bh = qemu_bh_new(nrf51_rtc_tick, s);
-    s->ptimer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
+    s->qtimer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nrf51_rtc_timer, s);
     s->bRunning = false;
 
+    qemu_mutex_init(&s->mtx);
     num_rtc_instance++;
 }
 
@@ -2291,17 +3629,86 @@ static void nrf51_uart_init(Object *obj)
     nrf51_uart_comm_init();
 }
 
-void nrf51_trigger_hardfault(void)
+static void nrf51_ficr_init(Object *obj)
 {
-    printf("FIXME: trigger HardFault\n");
-    fflush(stdout);
-    for(;;)
-        ;
+    nrf51_ficr_state *s = NRF51_FICR_STATE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    INIT_DEV_STATE(s);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_ficr_ops, s,
+                          "mod-ficr", FICR_REG_SPACE);
+
+    sysbus_init_mmio(sbd, &s->iomem);
 }
 
-static void nrf51_clock_class_init(ObjectClass *class, void *data)
+static void nrf51_uicr_save_regs(nrf51_uicr_state * s)
 {
+    /*
+     * Registers are saved to file as they are.
+     * Using the same save file on a host that has
+     * different byte order is not suggested.
+     */
+    FILE * regfile = fopen(UICR_REG_FILE, "w");
+    bool ok = false;
 
+    if (regfile)
+    {
+        ok = (fwrite(&s->REG, sizeof(s->REG), 1, regfile) == 1);
+        fclose(regfile);
+        regfile = NULL;
+    }
+
+    if (ok)
+    {
+        fprintf(stderr, "Saved UICR regs\n");
+    }
+    else
+    {
+        fprintf(stderr, "error: cannot save UICR registers\n");
+    }
+}
+
+static void nrf51_uicr_load_regs(nrf51_uicr_state * s)
+{
+    FILE * regfile = fopen(UICR_REG_FILE, "r+b");
+    bool use_defaults = true;
+
+    if (regfile)
+    {
+        use_defaults = (fread(&s->REG, sizeof(s->REG), 1, regfile) != 1);
+        fclose(regfile);
+        regfile = NULL;
+    }
+
+    if (use_defaults)
+    {
+        fprintf(stderr, "warning: using default UICR values\n");
+        memset(&s->REG, 0xFF, sizeof(s->REG));
+    }
+}
+
+static void nrf51_uicr_init(Object *obj)
+{
+    nrf51_uicr_state *s = NRF51_UICR_STATE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    INIT_DEV_STATE(s);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_uicr_ops, s,
+                          "mod-uicr", UICR_REG_SPACE);
+
+    sysbus_init_mmio(sbd, &s->iomem);
+
+    nrf51_uicr_load_regs(s);
+}
+
+void _nrf51_trigger_hardfault(const char * file, int line)
+{
+    printf("FIXME: trigger HardFault, %s:%d\n", file, line);
+    fflush(stdout);
+    exit(-1);
+    //for(;;);
 }
 
 static void nrf51_ecb_class_init(ObjectClass *class, void *data)
@@ -2321,31 +3728,6 @@ static void nrf51_ecb_class_init(ObjectClass *class, void *data)
     }
 }
 
-static void nrf51_gpio_class_init(ObjectClass *class, void *data)
-{
-
-}
-
-static void nrf51_gpte_class_init(ObjectClass *class, void *data)
-{
-
-}
-
-static void nrf51_rtc_class_init(ObjectClass *class, void *data)
-{
-
-}
-
-static void nrf51_adc_class_init(ObjectClass *class, void *data)
-{
-
-}
-
-static void nrf51_uart_class_init(ObjectClass *class, void *data)
-{
-
-}
-
 static void nrf51_radio_init(Object *obj)
 {
     nrf51_radio_state *s = NRF51_RADIO_STATE(obj);
@@ -2362,9 +3744,15 @@ static void nrf51_radio_init(Object *obj)
     s->irq = qdev_get_gpio_in(nvic, IRQ_RADIO);
 
     bh = qemu_bh_new(nrf51_radio_timer, s);
-    s->ptimer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
+    ////s->ptimer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
+
+    {
+        extern void set_irq_17_ctx(void * opaque);
+        set_irq_17_ctx(s);
+    }
 
     s->REG.POWER = 1;
+    s->REG.FREQUENCY = 2;
 
     packet_handler_context[PROTO_RADIO] = s;
 
@@ -2377,7 +3765,6 @@ static void nrf51_timer_init(Object *obj)
     static char dev_name[] = "mod-timerX";
     nrf51_timer_state *s = NRF51_TIMER_STATE(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
-    //QEMUBH *bh;
 
     INIT_DEV_STATE(s);
 
@@ -2389,12 +3776,84 @@ static void nrf51_timer_init(Object *obj)
 
     sysbus_init_mmio(sbd, &s->iomem);
 
-    s->irq = qdev_get_gpio_in(nvic, TIMER_BASE_IRQ_LIST[num_timer_instance].irq);
+    s->irq = qdev_get_gpio_in(nvic, TIMER_CONFIG[num_timer_instance].irq);
 
-    //bh = qemu_bh_new(nrf51_uart_timer, s);
-    //s->ptimer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
+    s->base = (uint32_t)TIMER_CONFIG[num_timer_instance].base;
+    s->counter_max = TIMER_CONFIG[num_timer_instance].counter_max;
+
+    s->num_instance = num_timer_instance;
+
+    s->REG.PRESCALER = 4; //Value on reset
+
+    s->qtimer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nrf51_timer_qtick, s);
 
     num_timer_instance++;
+
+}
+
+static void nrf51_wdt_init(Object *obj)
+{
+    nrf51_wdt_state *s = NRF51_WDT_STATE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    INIT_DEV_STATE(s);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_wdt_ops, s,
+                          "mod-wdt", WDT_REG_SPACE);
+
+    sysbus_init_mmio(sbd, &s->iomem);
+
+    //Default values on reset
+    s->REG.RREN = s->REG.CONFIG = s->REG.REQSTATUS = 1;
+    s->REG.CRV = (uint32_t) -1;
+}
+
+static void nrf51_ppi_init(Object *obj)
+{
+    nrf51_ppi_state *s = NRF51_PPI_STATE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    INIT_DEV_STATE(s);
+
+    memset(&ppis, 0x00, sizeof(ppis));
+    ppis.event_map = g_new0(struct qht, 1);
+
+    //Initialize event to task map.
+    //There are 16 configurable and 12 fixed channels.
+    //We can have maximum 28 events configured,
+    //32 elements seems like a reasonable number.
+    qht_init(ppis.event_map, 32, QHT_MODE_AUTO_RESIZE);
+
+    ppi_add_event(20, TIMER0_BASE + O_TIMER_COMPARE0, RADIO_BASE + O_RADIO_TXEN);
+    ppi_add_event(21, TIMER0_BASE + O_TIMER_COMPARE0, RADIO_BASE + O_RADIO_RXEN);
+    ppi_add_event(22, TIMER0_BASE + O_TIMER_COMPARE1, RADIO_BASE + O_RADIO_DISABLE);
+    //ppi_add_event(23, RADIO_BASE + O_RADIO_BCMATCH, AAR TASK START);
+    ppi_add_event(24, RADIO_BASE + O_RADIO_READY, CCM_BASE + O_CCM_KSGEN);
+    ppi_add_event(25, RADIO_BASE + O_RADIO_ADDRESS, CCM_BASE + O_CCM_CRYPT);
+    ppi_add_event(26, RADIO_BASE + O_RADIO_ADDRESS, TIMER0_BASE + O_TIMER_CAPTURE1);
+    ppi_add_event(27, RADIO_BASE + O_RADIO_END, TIMER0_BASE + O_TIMER_CAPTURE2);
+    ppi_add_event(28, RTC0_BASE + O_RTC_COMPARE0, RADIO_BASE + O_RADIO_TXEN);
+    ppi_add_event(29, RTC0_BASE + O_RTC_COMPARE0, RADIO_BASE + O_RADIO_RXEN);
+    ppi_add_event(30, RTC0_BASE + O_RTC_COMPARE0, TIMER0_BASE + O_TIMER_CLEAR);
+    ppi_add_event(31, RTC0_BASE + O_RTC_COMPARE0, TIMER0_BASE + O_TIMER_START);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_ppi_ops, s,
+                          "mod-ppi", PPI_REG_SPACE);
+
+    sysbus_init_mmio(sbd, &s->iomem);
+}
+
+static void nrf51_ccm_init(Object *obj)
+{
+    nrf51_ccm_state *s = NRF51_CCM_STATE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    INIT_DEV_STATE(s);
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_ccm_ops, s,
+                          "mod-ccm", CCM_REG_SPACE);
+
+    sysbus_init_mmio(sbd, &s->iomem);
 
 }
 
@@ -2444,6 +3903,26 @@ static void nrf51_rng_init(Object *obj)
     bh = qemu_bh_new(nrf51_rng_random_cb, s);
     s->ptimer = ptimer_init(bh, PTIMER_POLICY_DEFAULT);
 
+}
+
+static void nrf51_nvm_init(Object *obj)
+{
+    nrf51_nvm_state *s = NRF51_NVM_STATE(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+
+    INIT_DEV_STATE(s);
+
+    MemoryRegion * const sysmem = get_system_memory();
+
+    memory_region_init_io(&s->iomem, obj, &nrf51_nvm_ops, s,
+                          "mod-nvm", NVM_REG_SPACE);
+
+    sysbus_init_mmio(sbd, &s->iomem);
+
+    //Moving this to class level init/finalize would be better instead of instance.
+    memory_region_init_rom_device(&s->flash, NULL, &nrf51_nvm_data_ops, s, "nrf51_flash", NRF51_FLASH_SIZE_IN_BYTES, &error_fatal);
+
+    memory_region_add_subregion(sysmem, NRF51_FLASH_ORIGIN, &s->flash); //Subregion at offset 0x0
 }
 
 static uint64_t nrf51_ecb_read(void *opaque, hwaddr offset,
@@ -2609,18 +4088,29 @@ static void nrf51_ecb_write(void *opaque, hwaddr offset,
 
 }
 
-static void nrf51_radio_class_init(ObjectClass *class, void *data)
-{
-}
+#pragma endregion //Implementation
 
-static void nrf51_timer_class_init(ObjectClass *class, void *data)
-{
-}
+#pragma region ClassInit
 
-static void nrf51_rng_class_init(ObjectClass *class, void *data)
-{
-}
+static void nrf51_clock_class_init(ObjectClass *class, void *data){}
+static void nrf51_gpio_class_init(ObjectClass *class, void *data){}
+static void nrf51_gpte_class_init(ObjectClass *class, void *data){}
+static void nrf51_rtc_class_init(ObjectClass *class, void *data){}
+static void nrf51_adc_class_init(ObjectClass *class, void *data){}
+static void nrf51_uart_class_init(ObjectClass *class, void *data){}
+static void nrf51_ficr_class_init(ObjectClass *class, void *data){}
+static void nrf51_radio_class_init(ObjectClass *class, void *data){}
+static void nrf51_timer_class_init(ObjectClass *class, void *data){}
+static void nrf51_rng_class_init(ObjectClass *class, void *data){}
+static void nrf51_nvm_class_init(ObjectClass *class, void *data){}
+static void nrf51_uicr_class_init(ObjectClass *class, void *data){}
+static void nrf51_wdt_class_init(ObjectClass *class, void *data){}
+static void nrf51_ppi_class_init(ObjectClass *class, void *data){}
+static void nrf51_ccm_class_init(ObjectClass *class, void *data){}
 
+#pragma endregion //ClassInit
+
+#pragma region QEMU_CALLS
 /*************************************\
  * QEMU Specific Calls
 \*************************************/
@@ -2636,12 +4126,18 @@ static void nrf51_register_types(void)
     type_register_static(&nrf51_mod_rtc);
     type_register_static(&nrf51_mod_timer);
     type_register_static(&nrf51_mod_uart);
-
+    type_register_static(&nrf51_mod_nvm);
+    type_register_static(&nrf51_mod_ficr);
+    type_register_static(&nrf51_mod_uicr);
+    type_register_static(&nrf51_mod_wdt);
+    type_register_static(&nrf51_mod_ppi);
+    type_register_static(&nrf51_mod_ccm);
 }
 
 type_init(nrf51_register_types)
 
 DEFINE_MACHINE("nrf51", nrf51_machine_init)
+#pragma endregion
 
 #ifdef __GNUC__
 #pragma GCC diagnostic pop

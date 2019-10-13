@@ -514,6 +514,11 @@ void armv7m_nvic_set_pending(void *opaque, int irq, bool secure)
 
     vec = (banked && secure) ? &s->sec_vectors[irq] : &s->vectors[irq];
 
+    if (irq == 17)
+    {
+        printf("IRQ 17 pending\n");
+    }
+
     trace_nvic_set_pending(irq, secure, vec->enabled, vec->prio);
 
     if (irq >= ARMV7M_EXCP_HARD && irq < ARMV7M_EXCP_PENDSV) {
@@ -623,11 +628,18 @@ bool armv7m_nvic_acknowledge_irq(void *opaque)
     return targets_secure;
 }
 
+void * irq_17_ctx = NULL;
+void set_irq_17_ctx(void * opaque)
+{
+    irq_17_ctx = opaque;
+}
+
 int armv7m_nvic_complete_irq(void *opaque, int irq, bool secure)
 {
     NVICState *s = (NVICState *)opaque;
     VecInfo *vec;
     int ret;
+    extern void nrf51_complete_irq_17(void * opaque);
 
     assert(irq > ARMV7M_EXCP_RESET && irq < s->num_irq);
 
@@ -635,6 +647,12 @@ int armv7m_nvic_complete_irq(void *opaque, int irq, bool secure)
         vec = &s->sec_vectors[irq];
     } else {
         vec = &s->vectors[irq];
+    }
+
+
+    if (irq == 17)
+    {
+        nrf51_complete_irq_17(irq_17_ctx);
     }
 
     trace_nvic_complete_irq(irq, secure);
